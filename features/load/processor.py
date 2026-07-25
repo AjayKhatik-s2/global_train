@@ -202,6 +202,7 @@ def run(
     output_dir: str,
     evidence_root: Optional[str] = None,
     cameras: Optional[List[str]] = None,
+    wagon_ids: Optional[List[str]] = None,  # None = all wagons; subset = wagon-wise
     every_nth: int = 2,
     max_frames: int = 0,    # legacy walks the full window; 0 = unbounded
     verbose: bool = True,
@@ -217,21 +218,26 @@ def run(
     target_cams = [c for c in C.TOP_CAMERAS if (cameras is None or c in cameras)]
     if not target_cams:
         return {}
+    wagons = (state.wagons if wagon_ids is None
+              else [w for w in state.wagons if w.global_id in wagon_ids])
+    if not wagons:
+        return {}
     timer = FeatureTimer(FEATURE_NAME, logger=log,
-                         total_units=len(target_cams) * len(state.wagons))
+                         total_units=len(target_cams) * len(wagons))
     timer.set_model_load(_model_load_s)
     summary: Dict[str, str] = {}
 
     if model is None:
         log.warning("[FEAT/load] %s missing -- NO_DATA for all wagons.", model_path)
-    log.info("[FEAT/load] start: %d wagons x %d camera(s)=%s  model_load=%.2fs  "
-             "(per-camera voting, >%.0f%% -> LOADED)",
-             len(state.wagons), len(target_cams), target_cams,
-             _model_load_s, _LOADED_RATIO_THRESHOLD * 100)
+    if verbose:
+        log.info("[FEAT/load] start: %d wagons x %d camera(s)=%s  model_load=%.2fs  "
+                 "(per-camera voting, >%.0f%% -> LOADED)",
+                 len(wagons), len(target_cams), target_cams,
+                 _model_load_s, _LOADED_RATIO_THRESHOLD * 100)
 
     for cam in target_cams:
         feature_out = feature_camera_dir(output_dir, FEATURE_NAME, cam)
-        for gw in state.wagons:
+        for gw in wagons:
             gw_id = gw.global_id
             with timer.wagon(gw_id, cam):
                 try:
@@ -259,5 +265,6 @@ def run(
                         print(f"  [load/{cam}/{gw_id}] FAILED: {e}")
 
     n_ok = sum(1 for v in summary.values() if v == C.STATUS_OK)
-    timer.log_summary(ok=n_ok, total=len(summary))
+    if verbose:
+        timer.log_summary(ok=n_ok, total=len(summary))
     return summary

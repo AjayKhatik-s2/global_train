@@ -196,6 +196,7 @@ def run(
     output_dir: str,
     evidence_root: Optional[str] = None,
     cameras: Optional[List[str]] = None,
+    wagon_ids: Optional[List[str]] = None,  # None = all wagons; subset = wagon-wise
     det_confidence: float = C.CONF_OCR_BOX,
     wagon_number_length: int = C.WAGON_NUMBER_LENGTH,
     every_nth: int = 1,
@@ -218,8 +219,12 @@ def run(
     ocr = _get_ocr()
     _model_load_s = time.time() - _t_ml
 
+    wagons = (state.wagons if wagon_ids is None
+              else [w for w in state.wagons if w.global_id in wagon_ids])
+    if not wagons:
+        return {}
     feature_out = feature_camera_dir(output_dir, FEATURE_NAME, camera_id)
-    timer = FeatureTimer(FEATURE_NAME, logger=log, total_units=len(state.wagons))
+    timer = FeatureTimer(FEATURE_NAME, logger=log, total_units=len(wagons))
     timer.set_model_load(_model_load_s)
     summary: Dict[str, str] = {}
 
@@ -228,11 +233,12 @@ def run(
     if ocr is None:
         log.warning("[FEAT/ocr] easyocr unavailable -- NO_DATA for all wagons.")
 
-    log.info("[FEAT/ocr] start: %d wagons (RIGHT_UP only)  model_load=%.2fs  "
-             "(legacy WagonNumberOCR + WagonNumberAggregator)",
-             len(state.wagons), _model_load_s)
+    if verbose:
+        log.info("[FEAT/ocr] start: %d wagons (RIGHT_UP only)  model_load=%.2fs  "
+                 "(legacy WagonNumberOCR + WagonNumberAggregator)",
+                 len(wagons), _model_load_s)
 
-    for gw in state.wagons:
+    for gw in wagons:
         gw_id = gw.global_id
         t0 = time.time()
         try:
@@ -384,5 +390,6 @@ def run(
             timer.stamp(gw_id, t0, camera_id)
 
     n_ok = sum(1 for v in summary.values() if v == C.STATUS_OK)
-    timer.log_summary(ok=n_ok, total=len(summary))
+    if verbose:
+        timer.log_summary(ok=n_ok, total=len(summary))
     return summary

@@ -450,6 +450,7 @@ def run(
     output_dir: str,
     evidence_root: Optional[str] = None,
     cameras: Optional[List[str]] = None,
+    wagon_ids: Optional[List[str]] = None,  # None = all wagons; subset = wagon-wise
     confidence: float = C.CONF_DAMAGE,
     verbose: bool = True,
     every_nth: int = 1,
@@ -469,8 +470,12 @@ def run(
     target_cams = [c for c in C.TOP_CAMERAS if (cameras is None or c in cameras)]
     if not target_cams:
         return {}
+    wagons = (state.wagons if wagon_ids is None
+              else [w for w in state.wagons if w.global_id in wagon_ids])
+    if not wagons:
+        return {}
     timer = FeatureTimer(FEATURE_NAME, logger=log,
-                         total_units=len(target_cams) * len(state.wagons))
+                         total_units=len(target_cams) * len(wagons))
     timer.set_model_load(_model_load_s)
     summary: Dict[str, str] = {}
 
@@ -482,13 +487,14 @@ def run(
 
     if yolo_model is None:
         log.warning("[FEAT/damage] %s missing -- NO_DATA for all wagons.", model_path)
-    log.info("[FEAT/damage] start: %d wagons x %d camera(s)=%s  model_load=%.2fs  "
-             "(DamageTracker + edge-zone + per-camera loaded filter)",
-             len(state.wagons), len(target_cams), target_cams, _model_load_s)
+    if verbose:
+        log.info("[FEAT/damage] start: %d wagons x %d camera(s)=%s  model_load=%.2fs  "
+                 "(DamageTracker + edge-zone + per-camera loaded filter)",
+                 len(wagons), len(target_cams), target_cams, _model_load_s)
 
     for cam in target_cams:
         feature_out = feature_camera_dir(output_dir, FEATURE_NAME, cam)
-        for gw in state.wagons:
+        for gw in wagons:
             gw_id = gw.global_id
             with timer.wagon(gw_id, cam):
                 try:
@@ -518,5 +524,6 @@ def run(
                         print(f"  [damage/{cam}/{gw_id}] FAILED: {e}")
 
     n_ok = sum(1 for v in summary.values() if v == C.STATUS_OK)
-    timer.log_summary(ok=n_ok, total=len(summary))
+    if verbose:
+        timer.log_summary(ok=n_ok, total=len(summary))
     return summary

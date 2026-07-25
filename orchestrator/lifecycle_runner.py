@@ -250,10 +250,17 @@ def stage_process_cameras(manifest: BatchManifest, ctx: RunContext,
         if c not in manifest.materialized_cameras:
             manifest.materialized_cameras.append(c)
 
-    # --- Stage 3: run each requested camera's registered features ---
-    _run_camera_features(manifest, ctx, cameras=todo, state=state,
-                         cache_root=cache_root, states_root=states_root,
-                         evidence_root=evidence_root)
+    # --- Stage 3: run features.  WAGON-WISE by default (each Global Wagon is the
+    # processing unit: for a wagon, run every applicable feature across its
+    # cameras, then move to the next wagon); WAGONEYE_FEATURE_SCHEDULER=camera
+    # selects the legacy camera-wise scheduler (identical outputs -- only the
+    # iteration order differs). ---
+    scheduler = os.getenv("WAGONEYE_FEATURE_SCHEDULER", "wagon").strip().lower()
+    _feat_runner = (_run_camera_features if scheduler == "camera"
+                    else _run_wagon_features)
+    _feat_runner(manifest, ctx, cameras=todo, state=state,
+                 cache_root=cache_root, states_root=states_root,
+                 evidence_root=evidence_root)
 
     # --- Stage 4: re-fuse from all currently available per-camera results ---
     manifest.fusion_revision += 1
@@ -336,6 +343,112 @@ def _run_camera_features(manifest: BatchManifest, ctx: RunContext, *,
             done.setdefault(cam, [])
             if feat not in done[cam]:
                 done[cam].append(feat)
+    manifest.completed_features = done
+
+
+# Per-wagon feature execution order.  LOAD must precede DAMAGE (the damage
+# floor-filter reads THIS wagon's load result); door/ocr are independent.  Same
+# per-wagon ordering the camera-wise path enforced via features_for_camera.
+_WAGON_FEATURE_ORDER = (CF.FEATURE_LOAD, CF.FEATURE_DAMAGE,
+                        CF.FEATURE_DOOR, CF.FEATURE_OCR)
+
+
+def _run_wagon_features(manifest: BatchManifest, ctx: RunContext, *,
+                        cameras: List[str], state, cache_root: str,
+                        states_root: str, evidence_root: str) -> None:
+    """WAGON-WISE Stage 3: the Global Wagon is the processing unit.
+
+    For each GW_n we run every applicable feature (LOAD -> DAMAGE -> DOOR ->
+    OCR) across the requested cameras, then move to the next wagon.  Each
+    processor is reused UNCHANGED -- it is simply scoped to one wagon via
+    `wagon_ids=[gw]` (its per-(wagon,camera) code path, fresh tracker, evidence
+    and snapshot selection are byte-for-byte the same as the camera-wise path;
+    only the outer iteration order differs).  Models load once (load_yolo cache).
+
+    Idempotency is preserved: a (camera, feature) whose completion marker matches
+    the current identity is not scheduled, and markers are written once after all
+    wagons finish -- identical semantics to the camera-wise scheduler.
+    """
+    from features.door   import processor as door_proc
+    from features.load   import processor as load_proc
+    from features.damage import processor as damage_proc
+    from features.ocr    import processor as ocr_proc
+    from orchestrator import feature_markers as FM
+
+    fmap = {
+        CF.FEATURE_DOOR:   door_proc.run,
+        CF.FEATURE_OCR:    ocr_proc.run,
+        CF.FEATURE_LOAD:   load_proc.run,
+        CF.FEATURE_DAMAGE: damage_proc.run,
+    }
+    gst_version = manifest.global_state_version or ""
+    done = manifest.completed_features
+
+    # 1) Determine the (camera, feature) work items: present cameras x enabled
+    #    features, minus any already up-to-date.  Grouped per feature -> cameras.
+    work_cams: Dict[str, List[str]] = {f: [] for f in _WAGON_FEATURE_ORDER}
+    identities: Dict[tuple, Any] = {}
+    for cam in cameras:
+        slot = manifest.cameras.get(cam)
+        etag = slot.etag if slot else None
+        source_key = slot.s3_key if slot else None
+        for feat in CF.features_for_camera(cam):
+            if not ctx.feature_config.is_enabled(feat):
+                continue
+            identity = FM.compute_identity(
+                camera_id=cam, feature=feat, source_key=source_key, etag=etag,
+                global_state_version=gst_version, feat_models_dir=ctx.feat_models_dir,
+            )
+            if FM.is_up_to_date(states_root, identity):
+                log.info("[FEATURE %s/%s/%s] up-to-date -- skip",
+                         manifest.batch_key, cam, feat)
+                done.setdefault(cam, [])
+                if feat not in done[cam]:
+                    done[cam].append(feat)
+                continue
+            work_cams[feat].append(cam)
+            identities[(cam, feat)] = identity
+
+    if not identities:
+        manifest.completed_features = done
+        return
+
+    active_feats = [f for f in _WAGON_FEATURE_ORDER if work_cams[f]]
+    n = len(state.wagons)
+    log.info("[STAGE3 %s] wagon-wise scheduling: %d wagons x features=%s "
+             "(cameras=%s)", manifest.batch_key, n,
+             active_feats, cameras)
+
+    # 2) Wagon-wise execution: one Global Wagon at a time, all its features.
+    failed: set = set()
+    for i, gw in enumerate(state.wagons, start=1):
+        gw_id = gw.global_id
+        for feat in active_feats:
+            cams = work_cams[feat]
+            try:
+                fmap[feat](
+                    state=state, cache_root=cache_root,
+                    feature_models_dir=ctx.feat_models_dir,
+                    output_dir=states_root, evidence_root=evidence_root,
+                    cameras=cams, wagon_ids=[gw_id], verbose=False,
+                )
+            except Exception as e:
+                for c in cams:
+                    failed.add((c, feat))
+                log.error("[WAGON %s/%s] feature %s crashed: %s",
+                          manifest.batch_key, gw_id, feat, e, exc_info=True)
+        if ctx.verbose and (i % 10 == 0 or i == n):
+            log.info("[STAGE3 %s] wagon-wise progress %d/%d  last=%s",
+                     manifest.batch_key, i, n, gw_id)
+
+    # 3) Markers once per (camera, feature) -- identical idempotency semantics.
+    for (cam, feat), identity in identities.items():
+        status = "FAILED" if (cam, feat) in failed else "OK"
+        FM.write_marker(states_root, identity, status=status,
+                        wagons_completed=len(state.wagons))
+        done.setdefault(cam, [])
+        if feat not in done[cam]:
+            done[cam].append(feat)
     manifest.completed_features = done
 
 

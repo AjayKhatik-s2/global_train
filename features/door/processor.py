@@ -536,6 +536,8 @@ def run(
     output_dir: str,
     evidence_root: Optional[str] = None,   # enables evidence persistence
     cameras: Optional[List[str]] = None,
+    wagon_ids: Optional[List[str]] = None,  # None = all wagons (camera-wise);
+                                            # a subset enables wagon-wise scheduling
     confidence: float = C.CONF_DOOR,
     every_nth: int = 1,
     max_frames: int = 0,           # 0 = unbounded (legacy used the whole wagon)
@@ -555,8 +557,13 @@ def run(
     target_cams = [c for c in C.SIDE_CAMERAS if (cameras is None or c in cameras)]
     if not target_cams:
         return {}
+    # Restrict to the requested wagon subset (wagon-wise scheduling); None = all.
+    wagons = (state.wagons if wagon_ids is None
+              else [w for w in state.wagons if w.global_id in wagon_ids])
+    if not wagons:
+        return {}
     timer = FeatureTimer(FEATURE_NAME, logger=log,
-                         total_units=len(target_cams) * len(state.wagons))
+                         total_units=len(target_cams) * len(wagons))
     timer.set_model_load(_model_load_s)
     summary: Dict[str, str] = {}
 
@@ -568,14 +575,15 @@ def run(
 
     if yolo_model is None:
         log.warning("[FEAT/door] %s missing; emitting NO_DATA.", model_path)
-    log.info("[FEAT/door] start: %d wagons x %d camera(s)=%s  model_load=%.2fs  "
-             "(conf>=%s, DoorTracker + IdentityMerger + GeometricPrior + Illumination)",
-             len(state.wagons), len(target_cams), target_cams, _model_load_s, confidence)
+    if verbose:
+        log.info("[FEAT/door] start: %d wagons x %d camera(s)=%s  model_load=%.2fs  "
+                 "(conf>=%s, DoorTracker + IdentityMerger + GeometricPrior + Illumination)",
+                 len(wagons), len(target_cams), target_cams, _model_load_s, confidence)
 
     for cam in target_cams:
         side = _SIDE_FOR_CAMERA[cam]
         feature_out = feature_camera_dir(output_dir, FEATURE_NAME, cam)
-        for gw in state.wagons:
+        for gw in wagons:
             gw_id = gw.global_id
             with timer.wagon(gw_id, cam):
                 try:
@@ -607,5 +615,6 @@ def run(
                         print(f"  [door/{cam}/{gw_id}] FAILED: {e}")
 
     n_ok = sum(1 for v in summary.values() if v == C.STATUS_OK)
-    timer.log_summary(ok=n_ok, total=len(summary))
+    if verbose:
+        timer.log_summary(ok=n_ok, total=len(summary))
     return summary

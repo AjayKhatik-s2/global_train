@@ -58,9 +58,9 @@ from core.frame_quality import (
 )
 
 from features._common import (
-    load_yolo, iter_wagon_frames, list_wagon_frames,
+    load_yolo, iter_wagon_frames, list_wagon_frames, iter_wagon_detections,
     write_per_wagon_json, empty_payload, FeatureTimer, feature_camera_dir, phase,
-    DEVICE, HALF,
+    DEVICE, HALF, RAW_DETECTIONS,
 )
 
 # Mature intelligence ported from legacy
@@ -203,7 +203,12 @@ def _run_tracker_one_camera(
             })
 
     # ------- frame loop (stable interior only) -------
-    for fi, frame in iter_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True):
+    # YOLO is run in BATCHES (WAGONEYE_INFER_BATCH) to amortize CPU per-call
+    # overhead; illumination, the geometric prior, the Kalman tracker, and
+    # evidence bucketing all still run per-frame and IN ORDER, so tracking /
+    # snapshot behaviour is unchanged (batch=1 => bit-identical single-frame).
+    for fi, frame, boxes, confs, clss in iter_wagon_detections(
+            yolo_model, cache_root, gw_id, camera_id, trim_stable=True):
         if frame_w == 0:
             frame_h, frame_w = frame.shape[:2]
         used += 1
@@ -216,22 +221,12 @@ def _run_tracker_one_camera(
         except Exception:
             quality = 1.0
 
-        # 2) YOLO detection on raw frame
-        # half/device from the process-resolved DEVICE: on GPU this stays
-        # half=True (identical to pre-migration); on CPU it drops to FP32.
-        try:
-            results = yolo_model(frame, verbose=False, half=HALF, device=DEVICE)[0]
-        except Exception:
-            continue
-        if results.boxes is None or len(results.boxes) == 0:
+        # 2) no detections this frame -> tracker predict-only step
+        if boxes is None or len(boxes) == 0:
             tracker.update([], frame=frame,
                            frame_width=frame_w, frame_height=frame_h)
             _snapshot_confirmed(fi)
             continue
-
-        boxes = results.boxes.xyxy.cpu().numpy()
-        confs = results.boxes.conf.cpu().numpy()
-        clss  = results.boxes.cls.cpu().numpy().astype(int)
 
         # 3) confidence floor (the tracker has its own per-class thresholds
         #    too; this gate just discards obviously-noisy detections early).
@@ -244,13 +239,17 @@ def _run_tracker_one_camera(
             _snapshot_confirmed(fi)
             continue
 
-        # 4) geometric prior filter (aspect ratio / vertical-edge / border)
-        try:
-            boxes, confs, clss, _idx = geo_prior.filter_detections(
-                frame, boxes, confs, clss,
-            )
-        except Exception:
-            pass
+        # 4) geometric prior filter (aspect ratio / vertical-edge / border).
+        #    This is a post-inference REJECTION filter -> bypassed in
+        #    raw-detections benchmark mode (WAGONEYE_RAW_DETECTIONS=true), so the
+        #    detector's raw conf-thresholded boxes flow straight to the tracker.
+        if not RAW_DETECTIONS:
+            try:
+                boxes, confs, clss, _idx = geo_prior.filter_detections(
+                    frame, boxes, confs, clss,
+                )
+            except Exception:
+                pass
 
         # 5) convert to Detection objects + feed tracker
         names = getattr(yolo_model, "names", {}) or {}
@@ -322,21 +321,25 @@ def _run_tracker_one_camera(
 
     # Run identity merger on the final track set (collapses fragmented IDs
     # of the same physical door).  Operates on the live + deleted track
-    # objects exposed by the tracker.
-    try:
-        merger = DoorIdentityMerger(config=merger_config)
-        all_tracks_objs = list(tracker.tracks) + list(tracker.deleted_tracks)
-        merged_groups = merger.merge_all_tracks(all_tracks_objs)
-        # merge_all_tracks returns mapping {canonical_id: [member_ids]};
-        # we keep the canonical id for each group as the surviving track.
-        if isinstance(merged_groups, dict) and merged_groups:
-            merged_ids = set(merged_groups.keys())
-        elif isinstance(merged_groups, list) and merged_groups:
-            merged_ids = set(merged_groups)
-        else:
-            merged_ids = set(final_states.keys())
-    except Exception:
-        merged_ids = set(final_states.keys())   # fallback: keep everything
+    # objects exposed by the tracker.  This is a duplicate-suppression FILTER ->
+    # bypassed in raw-detections mode (keep every track the detector produced).
+    if RAW_DETECTIONS:
+        merged_ids = set(final_states.keys())
+    else:
+        try:
+            merger = DoorIdentityMerger(config=merger_config)
+            all_tracks_objs = list(tracker.tracks) + list(tracker.deleted_tracks)
+            merged_groups = merger.merge_all_tracks(all_tracks_objs)
+            # merge_all_tracks returns mapping {canonical_id: [member_ids]};
+            # we keep the canonical id for each group as the surviving track.
+            if isinstance(merged_groups, dict) and merged_groups:
+                merged_ids = set(merged_groups.keys())
+            elif isinstance(merged_groups, list) and merged_groups:
+                merged_ids = set(merged_groups)
+            else:
+                merged_ids = set(final_states.keys())
+        except Exception:
+            merged_ids = set(final_states.keys())   # fallback: keep everything
 
     decisions: List[Dict[str, Any]] = []
     all_tracks = list(tracker.tracks) + list(tracker.deleted_tracks)

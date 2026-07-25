@@ -893,6 +893,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-model-sync",  action="store_true",
                    help="do not verify/download models at startup (assume the "
                         ".pt files are already present locally)")
+    p.add_argument("--infer-batch", type=int, default=None,
+                   help="YOLO frames per CPU batch (default 24; 1 = single-frame "
+                        "bit-identical). Sets WAGONEYE_INFER_BATCH.")
+    p.add_argument("--raw-detections", action="store_true",
+                   help="BENCHMARK-ONLY: bypass post-inference rejection filters "
+                        "(geometric prior, identity merge, edge-zone, dedup, "
+                        "loaded/class skips) so raw conf-thresholded detections "
+                        "flow through. Sets WAGONEYE_RAW_DETECTIONS=true. "
+                        "Production behaviour is unchanged without this flag.")
     p.add_argument("--disable-features", default="",
                    help="comma-separated feature keys to turn OFF "
                         "(door,ocr,load,damage); skips the interactive prompt")
@@ -913,11 +922,26 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
 
+    # Apply CPU-throughput / benchmark flags into the environment BEFORE any
+    # feature module (features._common) is imported, since it reads these once
+    # at import time.  CLI overrides an already-set env var.
+    if args.infer_batch is not None:
+        os.environ["WAGONEYE_INFER_BATCH"] = str(max(1, args.infer_batch))
+    if args.raw_detections:
+        os.environ["WAGONEYE_RAW_DETECTIONS"] = "true"
+
     # Initialize logging before any stage runs.  A rotating file handler under
     # WAGONEYE_LOG_DIR (default <repo>/logs) plus stdout so foreground runs and
     # `journalctl`/`tail -f` both see the same structured, timestamped lines.
     setup_logging()
     log.info("WagonEye v4 orchestrator starting (device=%s)", _DEVICE)
+    try:
+        from features import _common as _CM
+        log.info("CPU throughput: infer_batch=%d  torch_threads=%s  raw_detections=%s",
+                 _CM.INFER_BATCH, os.getenv("WAGONEYE_TORCH_THREADS", "all-cores"),
+                 _CM.RAW_DETECTIONS)
+    except Exception:
+        pass
 
     # ---- Fail-fast configuration validation + redacted startup summary ----
     if args.local_only:

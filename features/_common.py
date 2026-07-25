@@ -47,6 +47,44 @@ HALF = CFG.use_half_precision(DEVICE)
 
 
 # -----------------------------------------------------------------------------
+# CPU throughput knobs (all env-overridable; safe -- they change SPEED, not the
+# business logic).  On CPU, batching YOLO across frames amortizes per-call
+# Python/pre/post-processing overhead; using all cores speeds each inference.
+#
+#   WAGONEYE_INFER_BATCH   frames per YOLO batch (default 16 -- benchmarked
+#                          fastest on the door model; 24 best for damage; 32 was
+#                          slower for both).  Set 1 for the exact pre-batch,
+#                          bit-identical single-frame path.
+#   WAGONEYE_TORCH_THREADS intra-op CPU threads (default: all cores).
+#   WAGONEYE_RAW_DETECTIONS bypass post-inference FILTERS (benchmark-only; see
+#                          each processor).  Default False = production behaviour.
+# -----------------------------------------------------------------------------
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+INFER_BATCH = max(1, _env_int("WAGONEYE_INFER_BATCH", 24))
+RAW_DETECTIONS = os.getenv("WAGONEYE_RAW_DETECTIONS", "").strip().lower() in (
+    "1", "true", "yes", "on")
+
+# Use all CPU cores by default (pure speed knob; deterministic outputs).
+try:
+    import torch as _torch
+    _threads = _env_int("WAGONEYE_TORCH_THREADS", os.cpu_count() or 0)
+    if _threads > 0:
+        _torch.set_num_threads(_threads)
+except Exception:
+    pass
+
+
+# -----------------------------------------------------------------------------
 # YOLO loader cache
 # -----------------------------------------------------------------------------
 
@@ -240,6 +278,68 @@ def run_detection(
                      float(bbox[2]), float(bbox[3])],
         })
     return out
+
+
+def iter_wagon_detections(
+    model, cache_root: str, gw_id: str, camera_id: str,
+    *, batch: Optional[int] = None, trim_stable: bool = True,
+    half: Optional[bool] = None, device: Optional[str] = None,
+) -> Iterator[Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Yield (frame_idx, BGR frame, boxes_xyxy, confs, class_ids) in monotonic
+    frame order, running YOLO in BATCHES to amortize CPU per-call overhead.
+
+    This is a drop-in replacement for the per-frame
+    ``for fi,frame in iter_wagon_frames(...): res = model(frame)...`` pattern:
+    the caller still sees one (frame, detections) tuple per frame IN ORDER, so
+    any stateful/sequential downstream (illumination, geometric prior, Kalman
+    tracker, evidence bucketing) is unchanged.  Only the raw detector call is
+    batched.
+
+    batch=1 uses the exact single-frame call ``model(frame)[0]`` -- bit-identical
+    to the pre-batch pipeline (the CPU-batched path can differ from single-frame
+    by <=1e-3 px in box coords due to BLAS reduction order; conf/class match).
+
+    Empty arrays are yielded for frames with no detections so the caller's
+    frame loop still runs (tracker predict-only step, event frames, etc.).
+    """
+    if model is None:
+        return
+    b = INFER_BATCH if batch is None else max(1, int(batch))
+    dev = device if device is not None else DEVICE
+    use_half = HALF if half is None else half
+
+    paths = list_wagon_frames(cache_root, gw_id, camera_id, trim_stable=trim_stable)
+    if not paths:
+        return
+
+    def _fi(p: str) -> int:
+        try:
+            return int(os.path.basename(p).split("_")[1].split(".")[0])
+        except (IndexError, ValueError):
+            return -1
+
+    def _extract(res):
+        if res.boxes is None or len(res.boxes) == 0:
+            z = np.empty((0, 4), dtype=np.float32)
+            return z, np.empty((0,), np.float32), np.empty((0,), np.int64)
+        return (res.boxes.xyxy.cpu().numpy(),
+                res.boxes.conf.cpu().numpy(),
+                res.boxes.cls.cpu().numpy().astype(int))
+
+    for start in range(0, len(paths), b):
+        chunk_paths = paths[start:start + b]
+        frames = [cv2.imread(p) for p in chunk_paths]
+        keep = [(p, f) for p, f in zip(chunk_paths, frames) if f is not None]
+        if not keep:
+            continue
+        kp, kf = [k[0] for k in keep], [k[1] for k in keep]
+        if len(kf) == 1:
+            results = [model(kf[0], verbose=False, half=use_half, device=dev)[0]]
+        else:
+            results = model(kf, verbose=False, half=use_half, device=dev)
+        for p, f, res in zip(kp, kf, results):
+            boxes, confs, clss = _extract(res)
+            yield _fi(p), f, boxes, confs, clss
 
 
 def run_classification(model, frame: np.ndarray,

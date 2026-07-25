@@ -56,9 +56,9 @@ from core.global_state_loader import GlobalTrainState
 from core.logging_setup import get_logger
 
 from features._common import (
-    load_yolo, iter_wagon_frames, list_wagon_frames,
+    load_yolo, iter_wagon_frames, list_wagon_frames, iter_wagon_detections,
     write_per_wagon_json, empty_payload, FeatureTimer, feature_camera_dir, phase,
-    DEVICE,
+    DEVICE, RAW_DETECTIONS,
 )
 
 # Mature intelligence ported from legacy
@@ -107,10 +107,16 @@ def _filter_detections_for_top(
     frame_w: int,
     frame_h: int,
     confidence_floor: float,
+    raw: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Apply ALL legacy top-camera damage filters in one pass.
+    """Apply the legacy top-camera damage filters in one pass.
 
     Returns the surviving (boxes, confs, cls_ids).
+
+    When ``raw`` is True (WAGONEYE_RAW_DETECTIONS), only the model's own
+    confidence threshold + non-damage class skip are applied; the heuristic
+    REJECTION filters (area-ratio band + edge-zone suppression) are bypassed so
+    the detector's raw predictions flow straight through.
     """
     keep_mask: List[bool] = []
     frame_area = max(1.0, float(frame_w) * float(frame_h))
@@ -122,6 +128,10 @@ def _filter_detections_for_top(
             continue
         if float(conf) < confidence_floor:
             keep_mask.append(False)
+            continue
+
+        if raw:
+            keep_mask.append(True)
             continue
 
         x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
@@ -181,30 +191,25 @@ def _run_tracker_one_camera(
     frame_w, frame_h = 0, 0
     used = 0
     frame_dets: List[Dict[str, Any]] = []
-    for fi, frame in iter_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True):
+    names = getattr(yolo_model, "names", {}) or {}
+    # YOLO is run in BATCHES (WAGONEYE_INFER_BATCH); the DamageTracker + all
+    # filters still run per-frame IN ORDER, so tracking/snapshots are unchanged
+    # (device only, no half -> identical FP32 behaviour; batch=1 == pre-batch).
+    for fi, frame, boxes, confs, clss in iter_wagon_detections(
+            yolo_model, cache_root, gw_id, camera_id, trim_stable=True,
+            half=False):
         if frame_w == 0:
             frame_h, frame_w = frame.shape[:2]
         used += 1
 
-        # device only (no half): pre-migration this call passed neither, so
-        # ultralytics ran FP32 on GPU.  Pinning device keeps that FP32 GPU
-        # behaviour identical while honouring WAGONEYE_DEVICE / CPU fallback.
-        try:
-            results = yolo_model(frame, verbose=False, device=DEVICE)[0]
-        except Exception:
-            continue
-        if results.boxes is None or len(results.boxes) == 0:
+        if boxes is None or len(boxes) == 0:
             tracker.update([], frame=frame,
                            frame_width=frame_w, frame_height=frame_h)
             continue
 
-        boxes = results.boxes.xyxy.cpu().numpy()
-        confs = results.boxes.conf.cpu().numpy()
-        clss  = results.boxes.cls.cpu().numpy().astype(int)
-        names = getattr(yolo_model, "names", {}) or {}
-
         boxes, confs, clss = _filter_detections_for_top(
             boxes, confs, clss, names, frame_w, frame_h, confidence_floor,
+            raw=RAW_DETECTIONS,
         )
         if len(boxes) == 0:
             tracker.update([], frame=frame,
@@ -334,7 +339,9 @@ def _process_wagon_camera_damage(
     Single-camera verdict only; any-top-camera DAMAGE fusion is Stage 4's job."""
     gw_id = gw.global_id
 
-    if gw.classification in (C.CLASS_ENGINE, C.CLASS_BRAKE_VAN):
+    # Non-wagon (engine/brake-van) skip is a wagon-level FILTER -> bypassed in
+    # raw-detections mode so the detector runs on every segment.
+    if gw.classification in (C.CLASS_ENGINE, C.CLASS_BRAKE_VAN) and not RAW_DETECTIONS:
         write_per_wagon_json(feature_out, gw_id, empty_payload(
             gw_id, FEATURE_NAME, C.STATUS_OK,
             camera_id=camera_id, damage_status=C.NO_DATA,
@@ -348,10 +355,14 @@ def _process_wagon_camera_damage(
             yolo_model, tracker_cfg, cache_root, gw_id, camera_id,
             confidence_floor=confidence,
         )
-        tracks = _dedup_cross_tracks(tracks)
+        # Cross-track de-dup is duplicate suppression -> bypassed in raw mode.
+        if not RAW_DETECTIONS:
+            tracks = _dedup_cross_tracks(tracks)
 
     # Loaded-wagon filter: drop floor_damage if THIS camera's load says LOADED.
-    if tracks and _load_status_for_camera(output_dir, gw_id, camera_id) == C.LOAD_LOADED:
+    # Post-inference REJECTION filter -> bypassed in raw-detections mode.
+    if (not RAW_DETECTIONS and tracks
+            and _load_status_for_camera(output_dir, gw_id, camera_id) == C.LOAD_LOADED):
         before = len(tracks)
         tracks = [t for t in tracks if t["class_name"] != "floor_damage"]
         fdets = [d for d in fdets if d["class_name"] != "floor_damage"]

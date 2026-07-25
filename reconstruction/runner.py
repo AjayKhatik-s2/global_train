@@ -24,9 +24,10 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from core import constants as C
 from core.global_state_loader import (
@@ -88,6 +89,20 @@ _CAM_FLAG = {
     C.CAMERA_RIGHT_UP_TOP: "--right_up_top",
     C.CAMERA_LEFT_UP_TOP:  "--left_up_top",
 }
+
+
+def _write_trace(output_dir: str, cmd: list, returncode: int,
+                 elapsed: float, lines: List[str]) -> None:
+    """Persist the full (stdout+stderr merged) subprocess trace per batch."""
+    try:
+        trace_path = os.path.join(output_dir, "stage1_wagon_count.log")
+        with open(trace_path, "w", encoding="utf-8") as fh:
+            fh.write(f"# cmd: {' '.join(cmd)}\n# exit={returncode} "
+                     f"elapsed={elapsed:.1f}s\n\n--- OUTPUT (stdout+stderr) ---\n")
+            fh.write("\n".join(lines))
+            fh.write("\n")
+    except Exception as e:  # never let logging bookkeeping fail the stage
+        log.warning("[STAGE1] could not write stage1 trace file: %s", e)
 
 
 def run(
@@ -158,51 +173,64 @@ def run(
     if verbose:
         log.info("[STAGE1] launching wagon_count: %s", " ".join(cmd))
 
+    # Stream the subprocess output LIVE into wagon_eye.log instead of buffering
+    # it until exit.  A reader thread relays each line the moment it is printed
+    # (the child runs with PYTHONUNBUFFERED=1 so its own print()s are flushed
+    # per line), so `tail -f logs/wagon_eye.log` shows reconstruction progress
+    # in real time.  stderr is merged into stdout to keep a single ordered trace.
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+
     t0 = time.time()
+    captured: List[str] = []
+
+    proc = subprocess.Popen(
+        cmd, cwd=wagon_count_dir,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, env=env,
+    )
+
+    def _pump() -> None:
+        # Relay every child line immediately; also keep it for the trace file.
+        try:
+            for raw in proc.stdout:                     # blocks per line
+                line = raw.rstrip("\n")
+                captured.append(line)
+                if verbose and line:
+                    log.info("[STAGE1] %s", line)
+        except Exception:                               # pragma: no cover
+            pass
+
+    reader = threading.Thread(target=_pump, name="stage1-log-pump", daemon=True)
+    reader.start()
+
     try:
-        proc = subprocess.run(
-            cmd, cwd=wagon_count_dir,
-            capture_output=True, text=True,
-            timeout=timeout_seconds,
-        )
+        proc.wait(timeout=timeout_seconds)              # hard cap, even on hang
     except subprocess.TimeoutExpired as e:
-        # Convert to ReconstructionError so process_batch's Stage-1 handler
-        # marks the batch failed_no_global_state and moves on, instead of an
-        # uncaught exception that would leave the batch un-checkpointed and
-        # retried forever on the next poll.
+        proc.kill()
+        reader.join(timeout=5)
         elapsed = time.time() - t0
         log.error("[STAGE1] wagon_count timed out after %.0fs (limit %ds)",
                   elapsed, timeout_seconds)
+        _write_trace(output_dir, cmd, -1, elapsed, captured)
         raise ReconstructionError(
             f"wagon_count subprocess timed out after {timeout_seconds}s"
         ) from e
+    reader.join(timeout=10)                             # drain remaining lines
     elapsed = time.time() - t0
 
     # Persist the FULL subprocess trace to a per-batch file (wagon_count stays
     # standalone -- it must not import core.logging_setup -- so its complete
-    # output is captured here rather than by the subprocess itself).
-    try:
-        trace_path = os.path.join(output_dir, "stage1_wagon_count.log")
-        with open(trace_path, "w", encoding="utf-8") as fh:
-            fh.write(f"# cmd: {' '.join(cmd)}\n# exit={proc.returncode} "
-                     f"elapsed={elapsed:.1f}s\n\n--- STDOUT ---\n")
-            fh.write(proc.stdout or "")
-            fh.write("\n\n--- STDERR ---\n")
-            fh.write(proc.stderr or "")
-    except Exception as e:  # never let logging bookkeeping fail the stage
-        log.warning("[STAGE1] could not write stage1 trace file: %s", e)
+    # output is captured here as well as streamed above).
+    _write_trace(output_dir, cmd, proc.returncode, elapsed, captured)
 
     if verbose:
-        tail = "\n".join(proc.stdout.splitlines()[-40:])
         log.info("[STAGE1] subprocess exit=%d (%.1fs)", proc.returncode, elapsed)
-        if tail:
-            log.info("[STAGE1] --- stdout tail ---\n%s\n[STAGE1] ----------------------",
-                     tail)
-        if proc.returncode != 0 and proc.stderr:
-            log.error("[STAGE1] --- stderr tail ---\n%s\n[STAGE1] ----------------------",
-                      proc.stderr[-2000:])
 
     if proc.returncode != 0:
+        if captured:
+            log.error("[STAGE1] --- output tail ---\n%s\n[STAGE1] ----------------------",
+                      "\n".join(captured[-40:]))
         raise ReconstructionError(
             f"wagon_count subprocess exited {proc.returncode}"
         )

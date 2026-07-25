@@ -281,6 +281,13 @@ class GapTracker:
 
         frame_idx = 0
         t0 = time.time()
+        # Live progress cadence (frames).  Env-overridable so operators can make
+        # it chattier/quieter without a code change; default 100.
+        try:
+            progress_interval = max(1, int(
+                os.getenv("WAGONEYE_PROGRESS_LOG_INTERVAL", "100") or 100))
+        except ValueError:
+            progress_interval = 100
 
         while True:
             if frame_limit and frame_idx >= frame_limit:
@@ -352,9 +359,25 @@ class GapTracker:
             active_tracks = still_active
 
             frame_idx += 1
-            if self.verbose and frame_idx % 200 == 0:
-                print(f"  ... frame {frame_idx}  active_tracks={len(active_tracks)}  "
-                      f"completed={len(completed_tracks)}")
+            # ---- live progress (every WAGONEYE_PROGRESS_LOG_INTERVAL frames) ----
+            # Streamed straight into logs/wagon_eye.log by the Stage-1 reader
+            # thread (PYTHONUNBUFFERED=1), so `tail -f` shows it in real time.
+            if self.verbose and frame_idx % progress_interval == 0:
+                elapsed = time.time() - t0
+                proc_fps = frame_idx / elapsed if elapsed > 0 else 0.0
+                if total_frames_meta > 0:
+                    pct = 100.0 * frame_idx / total_frames_meta
+                    remaining = max(0, total_frames_meta - frame_idx)
+                    eta = remaining / proc_fps if proc_fps > 0 else 0.0
+                    frac = f"{frame_idx}/{total_frames_meta} ({pct:.1f}%)"
+                    eta_s = f"{eta:.0f}s"
+                else:
+                    frac = f"{frame_idx}/?"
+                    eta_s = "?"
+                print(f"[GapTracker/{self.camera_id}] frame={frac} "
+                      f"fps={proc_fps:.1f} elapsed={elapsed:.0f}s eta={eta_s} "
+                      f"active_tracks={len(active_tracks)} "
+                      f"completed_gaps={len(completed_tracks)}")
 
         cap.release()
         # Flush surviving confirmed tracks
@@ -553,7 +576,8 @@ class MasterClassifier:
                     confidence=conf,
                 ))
                 if self.verbose:
-                    print(f"  [seg {idx}] frames {sf}-{ef} -> {seg_class} "
+                    print(f"[Classify/MASTER] segment {idx + 1}/"
+                          f"{len(segments)} frames {sf}-{ef} -> {seg_class} "
                           f"(raw='{label}', conf={conf:.2f})")
         finally:
             cap.release()

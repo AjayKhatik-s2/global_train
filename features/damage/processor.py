@@ -197,7 +197,7 @@ def _run_tracker_one_camera(
     # (device only, no half -> identical FP32 behaviour; batch=1 == pre-batch).
     for fi, frame, boxes, confs, clss in iter_wagon_detections(
             yolo_model, cache_root, gw_id, camera_id, trim_stable=True,
-            half=False):
+            fp16=False):
         if frame_w == 0:
             frame_h, frame_w = frame.shape[:2]
         used += 1

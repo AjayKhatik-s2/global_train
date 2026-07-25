@@ -307,12 +307,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-raw-detections", action="store_true",
                    help="Don't keep raw per-frame detections in memory (saves RAM)")
     p.add_argument("--quiet", action="store_true", help="Reduce log verbosity")
+    p.add_argument("--stage1-frame-trim-percent", type=float, default=None,
+                   help="Ignore the first/last N%% of frames during Stage-1 "
+                        "reconstruction only (default from "
+                        "WAGONEYE_STAGE1_FRAME_TRIM_PERCENT, itself 4; 0 = off). "
+                        "Frame numbering is preserved for all downstream stages.")
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     verbose = not args.quiet
+
+    # CLI overrides the env var read by GapTracker.process_video (single source
+    # of truth for the trim percent).
+    if args.stage1_frame_trim_percent is not None:
+        os.environ["WAGONEYE_STAGE1_FRAME_TRIM_PERCENT"] = str(
+            args.stage1_frame_trim_percent)
 
     t_start = time.time()
     print("=" * 70)

@@ -268,6 +268,27 @@ class GapTracker:
             print(f"\n[GapTracker/{self.camera_id}] {os.path.basename(video_path)}")
             print(f"  fps={fps:.3f}  frames={total_frames_meta}  size={width}x{height}")
 
+        # ---- Stage-1-only frame trimming --------------------------------------
+        # Ignore the first/last N% of frames DURING RECONSTRUCTION ONLY, to avoid
+        # false wagons from partially-visible wagons at the video edges.  Frame
+        # numbering is preserved: `frame_idx` still counts from 0 over the ORIGINAL
+        # video, so gap events (and therefore Stage 2 materialization, Stage 3
+        # inference, processed videos, reports, JSON) reference the same frame
+        # indices as before.  0% reproduces the prior behaviour exactly.
+        try:
+            trim_pct = float(os.getenv("WAGONEYE_STAGE1_FRAME_TRIM_PERCENT", "4") or 4)
+        except ValueError:
+            trim_pct = 4.0
+        trim_pct = max(0.0, min(49.0, trim_pct))
+        trim_start = int(total_frames_meta * trim_pct / 100.0)
+        trim_end = int(total_frames_meta * trim_pct / 100.0)
+        process_lo = trim_start                       # first analyzed frame_idx
+        process_hi = total_frames_meta - trim_end     # exclusive upper bound
+        if self.verbose:
+            print(f"[STAGE1] {self.camera_id}: total_frames={total_frames_meta}, "
+                  f"trimmed_start={trim_start}, trimmed_end={trim_end}, "
+                  f"processing_frames={max(0, process_hi - process_lo)}")
+
         active_tracks: List[_Track] = []
         completed_tracks: List[_Track] = []
         next_track_id = 1
@@ -295,6 +316,16 @@ class GapTracker:
             ret, frame = cap.read()
             if not ret:
                 break
+
+            # Stage-1 trim: analyze only [process_lo, process_hi); skip the edge
+            # frames but keep frame_idx advancing so gap events keep ORIGINAL
+            # frame numbers.  Stop once past the trimmed tail (nothing left to
+            # analyze).  With trim=0 this is a no-op (identical prior behaviour).
+            if frame_idx >= process_hi:
+                break
+            if frame_idx < process_lo:
+                frame_idx += 1
+                continue
 
             detections = self._detect_gaps(frame, height)
 

@@ -896,6 +896,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--infer-batch", type=int, default=None,
                    help="YOLO frames per CPU batch (default 24; 1 = single-frame "
                         "bit-identical). Sets WAGONEYE_INFER_BATCH.")
+    p.add_argument("--stage1-frame-trim-percent", type=float, default=None,
+                   help="Ignore the first/last N%% of frames during Stage-1 "
+                        "reconstruction ONLY (default 4; 0 = current behaviour). "
+                        "Downstream keeps original frame numbering. Sets "
+                        "WAGONEYE_STAGE1_FRAME_TRIM_PERCENT.")
     p.add_argument("--raw-detections", action="store_true",
                    help="BENCHMARK-ONLY: bypass post-inference rejection filters "
                         "(geometric prior, identity merge, edge-zone, dedup, "
@@ -927,6 +932,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # at import time.  CLI overrides an already-set env var.
     if args.infer_batch is not None:
         os.environ["WAGONEYE_INFER_BATCH"] = str(max(1, args.infer_batch))
+    if args.stage1_frame_trim_percent is not None:
+        os.environ["WAGONEYE_STAGE1_FRAME_TRIM_PERCENT"] = str(
+            args.stage1_frame_trim_percent)
     if args.raw_detections:
         os.environ["WAGONEYE_RAW_DETECTIONS"] = "true"
 

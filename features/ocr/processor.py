@@ -45,7 +45,7 @@ from core.logging_setup import get_logger
 from features._common import (
     load_yolo, run_detection, iter_wagon_frames, crop_bbox,
     write_per_wagon_json, empty_payload, FeatureTimer, feature_camera_dir, phase,
-    DEVICE, HALF,
+    DEVICE, HALF, precision_kwargs,
 )
 
 # Mature intelligence ported from legacy
@@ -116,9 +116,14 @@ def _process_one_wagon(
     for fi, frame in iter_wagon_frames(cache_root, gw_id, C.CAMERA_RIGHT_UP, trim_stable=True):
         used += 1
 
-        # Stage A: YOLO detection -- locate wagon-number bbox regions
+        # Stage A: YOLO detection -- locate wagon-number bbox regions.
+        # (FP16 requested via precision_kwargs -> CUDA uses the supported FP16
+        # mechanism; CPU passes nothing, so the deprecated `half=` arg is never
+        # sent.  On CPU this is identical to the old half=True call, which
+        # ultralytics ran as FP32 anyway.)
         try:
-            results = yolo_model(frame, verbose=False, half=True)[0]
+            results = yolo_model(frame, verbose=False, device=DEVICE,
+                                 **precision_kwargs(DEVICE, fp16=True))[0]
         except Exception:
             continue
         if results.boxes is None or len(results.boxes) == 0:

@@ -47,6 +47,52 @@ HALF = CFG.use_half_precision(DEVICE)
 
 
 # -----------------------------------------------------------------------------
+# FP16 precision selection -- migrated OFF the deprecated ultralytics `half=`
+# predict argument.  Newer ultralytics deprecates `half` in favour of `quantize`
+# ("'half' is deprecated ... Use 'quantize' instead").
+#
+# Root-cause fix (no warning suppression):
+#   * CPU  -> pass NOTHING (FP32 is the default; `half` was always False on CPU,
+#            so omitting it is behaviourally identical AND never triggers the
+#            deprecation warning).
+#   * CUDA -> use the CURRENT supported mechanism: `quantize` when the installed
+#            ultralytics exposes it, else the legacy `half=True` (older builds
+#            where `half` is still the supported key, e.g. 8.4.53).
+# `fp16=False` forces FP32 on every device (used by damage, which always ran
+# FP32 -- it never passed `half`).
+# -----------------------------------------------------------------------------
+
+_CUDA_FP16_KWARG: Optional[Dict[str, Any]] = None
+
+
+def _cuda_fp16_kwarg() -> Dict[str, Any]:
+    """The FP16 predict kwarg for CUDA on the installed ultralytics (cached)."""
+    global _CUDA_FP16_KWARG
+    if _CUDA_FP16_KWARG is None:
+        kw: Dict[str, Any] = {"half": True}          # legacy supported key
+        try:
+            from ultralytics.cfg import DEFAULT_CFG_DICT
+            if "quantize" in DEFAULT_CFG_DICT:        # current supported key
+                kw = {"quantize": "fp16"}
+        except Exception:
+            pass
+        _CUDA_FP16_KWARG = kw
+    return dict(_CUDA_FP16_KWARG)
+
+
+def precision_kwargs(device: Optional[str] = None, fp16: bool = True) -> Dict[str, Any]:
+    """Return the precision kwargs to splat into a YOLO predict call.
+
+    CPU (or fp16=False) -> {} (FP32, no deprecated arg).  CUDA + fp16 -> the
+    installed version's supported FP16 mechanism.
+    """
+    dev = device if device is not None else DEVICE
+    if not fp16 or dev != "cuda":
+        return {}
+    return _cuda_fp16_kwarg()
+
+
+# -----------------------------------------------------------------------------
 # CPU throughput knobs (all env-overridable; safe -- they change SPEED, not the
 # business logic).  On CPU, batching YOLO across frames amortizes per-call
 # Python/pre/post-processing overhead; using all cores speeds each inference.
@@ -242,22 +288,22 @@ def iter_wagon_frames(
 
 def run_detection(
     model, frame: np.ndarray,
-    *, confidence: float = 0.4, half: Optional[bool] = None,
+    *, confidence: float = 0.4, fp16: Optional[bool] = None,
     device: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Run a YOLO detection model on a frame; return clean dicts.
 
     Each dict: {class_id, class_name, confidence, bbox: [x1, y1, x2, y2]}.
 
-    device/half default to the process-resolved DEVICE/HALF (CUDA => FP16,
+    device/fp16 default to the process-resolved DEVICE/HALF (CUDA => FP16,
     CPU => FP32) -- callers may override but the defaults preserve the
     pre-migration GPU behaviour exactly.
     """
     if model is None:
         return []
     dev = device if device is not None else DEVICE
-    use_half = HALF if half is None else half
-    res = model(frame, verbose=False, half=use_half, device=dev)[0]
+    _fp16 = HALF if fp16 is None else bool(fp16)
+    res = model(frame, verbose=False, device=dev, **precision_kwargs(dev, _fp16))[0]
     if res.boxes is None or len(res.boxes) == 0:
         return []
 
@@ -283,7 +329,7 @@ def run_detection(
 def iter_wagon_detections(
     model, cache_root: str, gw_id: str, camera_id: str,
     *, batch: Optional[int] = None, trim_stable: bool = True,
-    half: Optional[bool] = None, device: Optional[str] = None,
+    fp16: Optional[bool] = None, device: Optional[str] = None,
 ) -> Iterator[Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """Yield (frame_idx, BGR frame, boxes_xyxy, confs, class_ids) in monotonic
     frame order, running YOLO in BATCHES to amortize CPU per-call overhead.
@@ -306,7 +352,8 @@ def iter_wagon_detections(
         return
     b = INFER_BATCH if batch is None else max(1, int(batch))
     dev = device if device is not None else DEVICE
-    use_half = HALF if half is None else half
+    _fp16 = HALF if fp16 is None else bool(fp16)
+    prec = precision_kwargs(dev, _fp16)
 
     paths = list_wagon_frames(cache_root, gw_id, camera_id, trim_stable=trim_stable)
     if not paths:
@@ -334,9 +381,9 @@ def iter_wagon_detections(
             continue
         kp, kf = [k[0] for k in keep], [k[1] for k in keep]
         if len(kf) == 1:
-            results = [model(kf[0], verbose=False, half=use_half, device=dev)[0]]
+            results = [model(kf[0], verbose=False, device=dev, **prec)[0]]
         else:
-            results = model(kf, verbose=False, half=use_half, device=dev)
+            results = model(kf, verbose=False, device=dev, **prec)
         for p, f, res in zip(kp, kf, results):
             boxes, confs, clss = _extract(res)
             yield _fi(p), f, boxes, confs, clss

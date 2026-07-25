@@ -167,17 +167,23 @@ main() {
 $(printf '\033[1;32m[setup] Done.\033[0m')
 
 Next steps:
-  1. Drop the 8 model .pt files into:
-       ${REPO_ROOT}/models/reconstruction/   (4 files)
-       ${REPO_ROOT}/models/features/         (4 files)
-  2. Configure environment (optional overrides):
+  1. Configure environment (bucket, region, model bucket, ...):
        cp deploy/wagon-eye.env.example deploy/wagon-eye.env  &&  edit it
-  3. Smoke test (no S3):
+       # set WAGONEYE_MODELS_S3_BUCKET to auto-sync models from S3, OR
+       # 'git lfs pull' if the .pt weights are tracked in this repo.
+  2. Run the pre-flight validator (deps, dirs, config, models, AWS/IAM):
        source ${VENV_DIR}/bin/activate
+       set -a; . deploy/wagon-eye.env; set +a
+       python scripts/preflight.py --mode local --sync      # --sync downloads missing models
+  3. Damage-only smoke test (recommended first validation, no S3):
        python -m orchestrator.master_runner --local-only \\
-           --local-inputs ./local_inputs --no-interactive
+           --local-inputs ./local_inputs --no-interactive \\
+           --disable-features door,ocr,load
   4. Install the service (continuous S3 polling):
-       see deploy/wagon-eye.service and DEPLOYMENT.md
+       see deploy/wagon-eye.service, EC2_SETUP.md, and DEPLOYMENT.md
+
+  Models are fetched automatically at startup when WAGONEYE_MODELS_S3_BUCKET is
+  set; no manual .pt placement is required on a fresh box.
 
 EOF
 }

@@ -53,10 +53,11 @@ import numpy as np
 
 from core import constants as C
 from core.global_state_loader import GlobalTrainState
+from core.logging_setup import get_logger
 
 from features._common import (
     load_yolo, iter_wagon_frames, list_wagon_frames,
-    write_per_wagon_json, empty_payload, FeatureTimer, feature_camera_dir,
+    write_per_wagon_json, empty_payload, FeatureTimer, feature_camera_dir, phase,
     DEVICE,
 )
 
@@ -71,6 +72,7 @@ from features._evidence import (
 
 
 FEATURE_NAME = "damage"
+log = get_logger("features.damage")
 
 
 # -----------------------------------------------------------------------------
@@ -325,6 +327,7 @@ def _process_wagon_camera_damage(
     yolo_model, tracker_cfg, cache_root: str, gw, camera_id: str,
     feature_out: str, output_dir: str, evidence_root: Optional[str],
     confidence: float, verbose: bool,
+    timer: Optional[FeatureTimer] = None,
 ) -> str:
     """Run damage for ONE top camera on ONE wagon; write damage/<CAMERA>/<gw>.json.
 
@@ -340,11 +343,12 @@ def _process_wagon_camera_damage(
         ))
         return C.STATUS_OK
 
-    tracks, used, _, _, fdets = _run_tracker_one_camera(
-        yolo_model, tracker_cfg, cache_root, gw_id, camera_id,
-        confidence_floor=confidence,
-    )
-    tracks = _dedup_cross_tracks(tracks)
+    with phase(timer, "inference"):
+        tracks, used, _, _, fdets = _run_tracker_one_camera(
+            yolo_model, tracker_cfg, cache_root, gw_id, camera_id,
+            confidence_floor=confidence,
+        )
+        tracks = _dedup_cross_tracks(tracks)
 
     # Loaded-wagon filter: drop floor_damage if THIS camera's load says LOADED.
     if tracks and _load_status_for_camera(output_dir, gw_id, camera_id) == C.LOAD_LOADED:
@@ -370,8 +374,8 @@ def _process_wagon_camera_damage(
     if evidence_root:
         final_dir = os.path.join(evidence_root, gw_id, FEATURE_NAME, camera_id)
         track_meta: List[Dict[str, Any]] = []
-        with atomic_camera_evidence(evidence_root, gw_id, FEATURE_NAME,
-                                    camera_id) as ev_tmp:
+        with phase(timer, "evidence"), atomic_camera_evidence(
+                evidence_root, gw_id, FEATURE_NAME, camera_id) as ev_tmp:
             if fdets:
                 write_metadata(os.path.join(ev_tmp, "overlay.json"), {
                     "global_id": gw_id, "feature": FEATURE_NAME,
@@ -447,12 +451,16 @@ def run(
     del every_nth, max_frames, min_persistent_frames  # legacy tracker owns persistence
 
     model_path = os.path.join(feature_models_dir, C.MODEL_DAMAGE)
+    _t_ml = time.time()
     yolo_model = load_yolo(model_path)
+    _model_load_s = time.time() - _t_ml
 
     target_cams = [c for c in C.TOP_CAMERAS if (cameras is None or c in cameras)]
     if not target_cams:
         return {}
-    timer = FeatureTimer("damage")
+    timer = FeatureTimer(FEATURE_NAME, logger=log,
+                         total_units=len(target_cams) * len(state.wagons))
+    timer.set_model_load(_model_load_s)
     summary: Dict[str, str] = {}
 
     tracker_cfg = DamageTrackerConfig(
@@ -461,45 +469,43 @@ def run(
         max_center_distance=200.0, iou_weight=0.0, distance_weight=1.0,
     )
 
-    if yolo_model is None and verbose:
-        print(f"[FEAT/damage] WARNING: {model_path} missing -- NO_DATA for all wagons.")
-    if verbose:
-        print(f"[FEAT/damage] running on {len(state.wagons)} wagons, cameras={target_cams} "
-              f"(legacy DamageTracker + edge-zone + per-camera loaded filter)")
+    if yolo_model is None:
+        log.warning("[FEAT/damage] %s missing -- NO_DATA for all wagons.", model_path)
+    log.info("[FEAT/damage] start: %d wagons x %d camera(s)=%s  model_load=%.2fs  "
+             "(DamageTracker + edge-zone + per-camera loaded filter)",
+             len(state.wagons), len(target_cams), target_cams, _model_load_s)
 
     for cam in target_cams:
         feature_out = feature_camera_dir(output_dir, FEATURE_NAME, cam)
         for gw in state.wagons:
             gw_id = gw.global_id
-            t0 = time.time()
-            try:
-                if yolo_model is None:
+            with timer.wagon(gw_id, cam):
+                try:
+                    if yolo_model is None:
+                        write_per_wagon_json(feature_out, gw_id, empty_payload(
+                            gw_id, FEATURE_NAME, C.NO_DATA,
+                            camera_id=cam, damage_status=C.NO_DATA,
+                            top_damage_details=[], supporting_cameras=[],
+                            error="damage.pt not present",
+                        ))
+                        summary[gw_id] = C.NO_DATA
+                        continue
+                    summary[gw_id] = _process_wagon_camera_damage(
+                        yolo_model, tracker_cfg, cache_root, gw, cam,
+                        feature_out, output_dir, evidence_root, confidence, verbose,
+                        timer=timer,
+                    )
+                except Exception as e:
                     write_per_wagon_json(feature_out, gw_id, empty_payload(
-                        gw_id, FEATURE_NAME, C.NO_DATA,
+                        gw_id, FEATURE_NAME, C.STATUS_FAILED,
                         camera_id=cam, damage_status=C.NO_DATA,
-                        top_damage_details=[], supporting_cameras=[],
-                        error="damage.pt not present",
+                        error=f"{type(e).__name__}: {e}",
+                        traceback=traceback.format_exc(limit=2),
                     ))
-                    summary[gw_id] = C.NO_DATA
-                    continue
-                summary[gw_id] = _process_wagon_camera_damage(
-                    yolo_model, tracker_cfg, cache_root, gw, cam,
-                    feature_out, output_dir, evidence_root, confidence, verbose,
-                )
-            except Exception as e:
-                write_per_wagon_json(feature_out, gw_id, empty_payload(
-                    gw_id, FEATURE_NAME, C.STATUS_FAILED,
-                    camera_id=cam, damage_status=C.NO_DATA,
-                    error=f"{type(e).__name__}: {e}",
-                    traceback=traceback.format_exc(limit=2),
-                ))
-                summary[gw_id] = C.STATUS_FAILED
-                if verbose:
-                    print(f"  [damage/{cam}/{gw_id}] FAILED: {e}")
-            finally:
-                timer.stamp(gw_id, t0)
+                    summary[gw_id] = C.STATUS_FAILED
+                    if verbose:
+                        print(f"  [damage/{cam}/{gw_id}] FAILED: {e}")
 
-    if verbose:
-        n_ok = sum(1 for v in summary.values() if v == C.STATUS_OK)
-        print(f"[FEAT/damage] done in {timer.total():.1f}s  ok={n_ok}/{len(summary)}")
+    n_ok = sum(1 for v in summary.values() if v == C.STATUS_OK)
+    timer.log_summary(ok=n_ok, total=len(summary))
     return summary

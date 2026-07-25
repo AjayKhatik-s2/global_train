@@ -680,6 +680,26 @@ def _attach_candidate(cv, actives, processed, ctx, tolerance_sec):
     BM.save_s3(ctx.s3_client, target)
 
 
+def _make_extraction_manager(source, poll_interval):
+    """Build the ExtractionManager for a RAW pipeline source, or None.
+
+    Kept tiny on purpose: master_runner only decides WHETHER extraction is
+    needed (from the pipeline source) and owns the manager's lifecycle -- all
+    extraction orchestration lives in the ExtractionManager itself.  Returns
+    None for a TRIMMED source (pure consumer) or if the manager can't be built.
+    """
+    if not source.requires_extraction:
+        return None
+    try:
+        from orchestrator.extraction_manager import ExtractionManager
+    except Exception as e:
+        log.error("[ORCH] pipeline source is RAW but ExtractionManager is "
+                  "unavailable: %s -- continuing as pure consumer", e,
+                  exc_info=True)
+        return None
+    return ExtractionManager(poll_interval=poll_interval)
+
+
 def run_auto(*args, **kwargs):
     """Continuous S3 polling loop -- manifest-driven, resumable, multi-batch.
 
@@ -727,6 +747,26 @@ def run_auto(*args, **kwargs):
     log.info("[ORCH] workspace: %s | terminal batches so far: %d",
              workspace_root, len(processed))
 
+    # Pipeline source decides where the input comes from.  RAW -> own an
+    # ExtractionManager that produces trimmed clips into the input location we
+    # then consume; TRIMMED -> pure consumer.  master_runner only owns the
+    # manager's lifecycle here; all extraction orchestration is inside it.
+    source = CFG.PipelineSource.resolve(kwargs.get("source"))
+    extractor = _make_extraction_manager(source, CFG.EXTRACTION_POLL_INTERVAL)
+    if extractor is not None:
+        if run_once:
+            # --once/--batch: produce one raw->trimmed sweep synchronously so a
+            # single-shot raw->report run has its inputs before we consume.
+            log.info("[ORCH] source=raw, run-once -- one extraction sweep then consume")
+            extractor.run_once()
+        else:
+            log.info("[ORCH] source=raw -- ExtractionManager will produce trimmed "
+                     "clips from raw S3 for this pipeline to consume")
+            extractor.start()
+    else:
+        log.info("[ORCH] source=%s -- pure consumer (polls already-trimmed "
+                 "input prefixes)", source.value)
+
     while not _SHUTDOWN_REQUESTED:
         try:
             actives = {m.batch_key: m for m in
@@ -765,6 +805,8 @@ def run_auto(*args, **kwargs):
                 return 3
             time.sleep(poll_interval)
 
+    if extractor is not None and extractor.is_running():
+        extractor.stop(timeout=30)
     log.info("[ORCH] shutdown complete")
     return 0
 
@@ -848,12 +890,23 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--partial-wait",     type=float, default=30.0)
     p.add_argument("--skip-upload",      action="store_true")
     p.add_argument("--skip-email",       action="store_true")
+    p.add_argument("--skip-model-sync",  action="store_true",
+                   help="do not verify/download models at startup (assume the "
+                        ".pt files are already present locally)")
     p.add_argument("--disable-features", default="",
                    help="comma-separated feature keys to turn OFF "
                         "(door,ocr,load,damage); skips the interactive prompt")
     p.add_argument("--no-interactive",   action="store_true",
                    help="never prompt for feature config (force all-ON unless "
                         "--disable-features given)")
+    # What the pipeline consumes (see core.pipeline_source).  Default None =
+    # follow WAGONEYE_PIPELINE_SOURCE (itself defaulting to 'trimmed').
+    p.add_argument("--source", dest="source", choices=["trimmed", "raw"],
+                   default=None,
+                   help="pipeline input source: 'trimmed' (default; already-cut "
+                        "clips in the input prefixes -- pure consumer) or 'raw' "
+                        "(discover raw CCTV and extract trains first via the "
+                        "ExtractionManager). Overrides WAGONEYE_PIPELINE_SOURCE.")
     return p
 
 
@@ -897,6 +950,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         interactive=interactive,
     )
 
+    # ---- Model availability + S3 auto-sync (fail-fast) ----
+    # Reconstruction models are always required; feature models only for the
+    # ENABLED features (a Damage-only run needs just damage.pt + recon).  Missing
+    # models are downloaded from WAGONEYE_MODELS_S3_BUCKET when set; otherwise a
+    # clear MISSING report is logged and startup is refused.
+    if not args.skip_model_sync:
+        from core import model_sync
+        report = model_sync.ensure_models_or_report(
+            enabled_features=feature_config.enabled_keys(),
+            s3_client=None, download=True,
+        )
+        if not report.ok:
+            log.error("[MODEL_SYNC] %d required model(s) unavailable -- refusing "
+                      "to start.  Fix the MISSING items above, or pass "
+                      "--skip-model-sync once the .pt files are in place.",
+                      len(report.missing))
+            return 2
+
     if args.local_only:
         return run_local(
             local_inputs=args.local_inputs,
@@ -922,6 +993,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         skip_upload=args.skip_upload,
         skip_email=args.skip_email,
         feature_config=feature_config,
+        source=args.source,
     )
 
 

@@ -40,10 +40,11 @@ import numpy as np
 
 from core import constants as C
 from core.global_state_loader import GlobalTrainState
+from core.logging_setup import get_logger
 
 from features._common import (
     load_yolo, run_detection, iter_wagon_frames, crop_bbox,
-    write_per_wagon_json, empty_payload, FeatureTimer, feature_camera_dir,
+    write_per_wagon_json, empty_payload, FeatureTimer, feature_camera_dir, phase,
     DEVICE, HALF,
 )
 
@@ -59,6 +60,7 @@ from features._evidence import (
 
 
 FEATURE_NAME = "ocr"
+log = get_logger("features.ocr")
 
 
 # -----------------------------------------------------------------------------
@@ -206,21 +208,24 @@ def run(
         return {}
 
     model_path = os.path.join(feature_models_dir, C.MODEL_WAGON_ID_COUNTING)
+    _t_ml = time.time()
     yolo_model = load_yolo(model_path)
     ocr = _get_ocr()
+    _model_load_s = time.time() - _t_ml
 
     feature_out = feature_camera_dir(output_dir, FEATURE_NAME, camera_id)
-    timer = FeatureTimer("ocr")
+    timer = FeatureTimer(FEATURE_NAME, logger=log, total_units=len(state.wagons))
+    timer.set_model_load(_model_load_s)
     summary: Dict[str, str] = {}
 
-    if yolo_model is None and verbose:
-        print(f"[FEAT/ocr] WARNING: {model_path} missing -- NO_DATA for all wagons.")
-    if ocr is None and verbose:
-        print(f"[FEAT/ocr] WARNING: easyocr unavailable -- NO_DATA for all wagons.")
+    if yolo_model is None:
+        log.warning("[FEAT/ocr] %s missing -- NO_DATA for all wagons.", model_path)
+    if ocr is None:
+        log.warning("[FEAT/ocr] easyocr unavailable -- NO_DATA for all wagons.")
 
-    if verbose:
-        print(f"[FEAT/ocr] running on {len(state.wagons)} wagons "
-              f"(legacy WagonNumberOCR + WagonNumberAggregator, RIGHT_UP only)")
+    log.info("[FEAT/ocr] start: %d wagons (RIGHT_UP only)  model_load=%.2fs  "
+             "(legacy WagonNumberOCR + WagonNumberAggregator)",
+             len(state.wagons), _model_load_s)
 
     for gw in state.wagons:
         gw_id = gw.global_id
@@ -254,9 +259,10 @@ def run(
                 summary[gw_id] = C.STATUS_OK
                 continue
 
-            outcome = _process_one_wagon(
-                yolo_model, ocr, cache_root, gw_id, det_confidence,
-            )
+            with phase(timer, "inference"):
+                outcome = _process_one_wagon(
+                    yolo_model, ocr, cache_root, gw_id, det_confidence,
+                )
             used = outcome["frame_count"]
             aggregated = outcome["aggregated"]
 
@@ -312,8 +318,8 @@ def run(
             if evidence_root and best_obj is not None and best_obj.has_data():
                 final_dir = os.path.join(evidence_root, gw_id, FEATURE_NAME, camera_id)
                 crop_img = safe_crop(best_obj.frame, best_obj.bbox, pad=4)
-                with atomic_camera_evidence(evidence_root, gw_id, FEATURE_NAME,
-                                            camera_id) as ev_tmp:
+                with phase(timer, "evidence"), atomic_camera_evidence(
+                        evidence_root, gw_id, FEATURE_NAME, camera_id) as ev_tmp:
                     annotated = draw_annotated_bbox(
                         best_obj.frame, best_obj.bbox,
                         label=f"OCR {best_obj.meta.get('full_number','?')} "
@@ -370,9 +376,8 @@ def run(
             if verbose:
                 print(f"  [ocr/{gw_id}] FAILED: {e}")
         finally:
-            timer.stamp(gw_id, t0)
+            timer.stamp(gw_id, t0, camera_id)
 
-    if verbose:
-        n_ok = sum(1 for v in summary.values() if v == C.STATUS_OK)
-        print(f"[FEAT/ocr] done in {timer.total():.1f}s  ok={n_ok}/{len(summary)}")
+    n_ok = sum(1 for v in summary.values() if v == C.STATUS_OK)
+    timer.log_summary(ok=n_ok, total=len(summary))
     return summary

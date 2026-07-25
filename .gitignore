@@ -10,6 +10,13 @@ venv/
 logs/
 *.log
 
+# Per-batch pipeline outputs (regenerated at runtime; never committed)
+batch_outputs/
+
+# Local env override (secrets/bucket names)
+deploy/wagon-eye.env
+deploy/wagon-eye-extraction.env
+
 # Pytest
 .pytest_cache/
 

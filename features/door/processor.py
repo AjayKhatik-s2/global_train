@@ -52,13 +52,14 @@ import numpy as np
 
 from core import constants as C
 from core.global_state_loader import GlobalTrainState
+from core.logging_setup import get_logger
 from core.frame_quality import (
     detection_quality, snapshot_score, expand_bbox, _DOOR_BBOX_EXPAND_FRAC,
 )
 
 from features._common import (
     load_yolo, iter_wagon_frames, list_wagon_frames,
-    write_per_wagon_json, empty_payload, FeatureTimer, feature_camera_dir,
+    write_per_wagon_json, empty_payload, FeatureTimer, feature_camera_dir, phase,
     DEVICE, HALF,
 )
 
@@ -82,6 +83,7 @@ from features._evidence import (
 
 
 FEATURE_NAME = "door"
+log = get_logger("features.door")
 
 
 # -----------------------------------------------------------------------------
@@ -434,16 +436,18 @@ def _process_wagon_camera_door(
     yolo_model, illumination, geo_prior, tracker_cfg, merger_cfg,
     cache_root: str, gw, camera_id: str, feature_out: str,
     evidence_root: Optional[str], verbose: bool,
+    timer: Optional[FeatureTimer] = None,
 ) -> str:
     """Run the door pipeline for ONE side camera on ONE wagon; write
     door/<CAMERA>/<gw>.json (RIGHT_UP -> right door, LEFT_UP -> left door)."""
     gw_id = gw.global_id
     side = _SIDE_FOR_CAMERA[camera_id]
 
-    decisions, used, _, _, cands, overlay = _run_tracker_one_camera(
-        yolo_model, illumination, geo_prior, tracker_cfg, merger_cfg,
-        cache_root, gw_id, camera_id,
-    )
+    with phase(timer, "inference"):
+        decisions, used, _, _, cands, overlay = _run_tracker_one_camera(
+            yolo_model, illumination, geo_prior, tracker_cfg, merger_cfg,
+            cache_root, gw_id, camera_id,
+        )
     if used == 0:
         write_per_wagon_json(feature_out, gw_id, empty_payload(
             gw_id, FEATURE_NAME, C.STATUS_NO_FRAMES,
@@ -463,8 +467,8 @@ def _process_wagon_camera_door(
     if evidence_root and (best.has_data() or overlay.get("tracks") or overlay.get("events")):
         final_dir = os.path.join(evidence_root, gw_id, FEATURE_NAME, camera_id)
         crop_img = safe_crop(best.frame, best.bbox, pad=12) if best.has_data() else None
-        with atomic_camera_evidence(evidence_root, gw_id, FEATURE_NAME,
-                                    camera_id) as ev_tmp:
+        with phase(timer, "evidence"), atomic_camera_evidence(
+                evidence_root, gw_id, FEATURE_NAME, camera_id) as ev_tmp:
             if best.has_data():
                 annotated = draw_annotated_bbox(
                     best.frame, best.bbox,
@@ -541,12 +545,16 @@ def run(
     del every_nth, max_frames  # kept for API symmetry; we iterate every frame
 
     model_path = os.path.join(feature_models_dir, C.MODEL_DOOR_STATE)
+    _t_ml = time.time()
     yolo_model = load_yolo(model_path)
+    _model_load_s = time.time() - _t_ml
 
     target_cams = [c for c in C.SIDE_CAMERAS if (cameras is None or c in cameras)]
     if not target_cams:
         return {}
-    timer = FeatureTimer("door")
+    timer = FeatureTimer(FEATURE_NAME, logger=log,
+                         total_units=len(target_cams) * len(state.wagons))
+    timer.set_model_load(_model_load_s)
     summary: Dict[str, str] = {}
 
     # Shared per-process helpers (loaded once across wagons + cameras)
@@ -555,49 +563,46 @@ def run(
     tracker_cfg  = TrackerConfig()
     merger_cfg   = MergeConfig()
 
-    if yolo_model is None and verbose:
-        print(f"[FEAT/door] WARNING: {model_path} missing; emitting NO_DATA.")
-    if verbose:
-        print(f"[FEAT/door] running on {len(state.wagons)} wagons, cameras={target_cams} "
-              f"(conf>={confidence}, legacy DoorTracker + IdentityMerger + "
-              f"GeometricPrior + IlluminationQuality)")
+    if yolo_model is None:
+        log.warning("[FEAT/door] %s missing; emitting NO_DATA.", model_path)
+    log.info("[FEAT/door] start: %d wagons x %d camera(s)=%s  model_load=%.2fs  "
+             "(conf>=%s, DoorTracker + IdentityMerger + GeometricPrior + Illumination)",
+             len(state.wagons), len(target_cams), target_cams, _model_load_s, confidence)
 
     for cam in target_cams:
         side = _SIDE_FOR_CAMERA[cam]
         feature_out = feature_camera_dir(output_dir, FEATURE_NAME, cam)
         for gw in state.wagons:
             gw_id = gw.global_id
-            t0 = time.time()
-            try:
-                if yolo_model is None:
+            with timer.wagon(gw_id, cam):
+                try:
+                    if yolo_model is None:
+                        write_per_wagon_json(feature_out, gw_id, empty_payload(
+                            gw_id, FEATURE_NAME, C.NO_DATA,
+                            camera_id=cam, side=side,
+                            door_state=C.NO_DATA, door_confidence=0.0,
+                            tracks=[], supporting_cameras=[],
+                            error="door_state.pt not present",
+                        ))
+                        summary[gw_id] = C.NO_DATA
+                        continue
+                    summary[gw_id] = _process_wagon_camera_door(
+                        yolo_model, illumination, geo_prior, tracker_cfg, merger_cfg,
+                        cache_root, gw, cam, feature_out, evidence_root, verbose,
+                        timer=timer,
+                    )
+                except Exception as e:
                     write_per_wagon_json(feature_out, gw_id, empty_payload(
-                        gw_id, FEATURE_NAME, C.NO_DATA,
+                        gw_id, FEATURE_NAME, C.STATUS_FAILED,
                         camera_id=cam, side=side,
-                        door_state=C.NO_DATA, door_confidence=0.0,
-                        tracks=[], supporting_cameras=[],
-                        error="door_state.pt not present",
+                        door_state=C.NO_DATA,
+                        error=f"{type(e).__name__}: {e}",
+                        traceback=traceback.format_exc(limit=2),
                     ))
-                    summary[gw_id] = C.NO_DATA
-                    continue
-                summary[gw_id] = _process_wagon_camera_door(
-                    yolo_model, illumination, geo_prior, tracker_cfg, merger_cfg,
-                    cache_root, gw, cam, feature_out, evidence_root, verbose,
-                )
-            except Exception as e:
-                write_per_wagon_json(feature_out, gw_id, empty_payload(
-                    gw_id, FEATURE_NAME, C.STATUS_FAILED,
-                    camera_id=cam, side=side,
-                    door_state=C.NO_DATA,
-                    error=f"{type(e).__name__}: {e}",
-                    traceback=traceback.format_exc(limit=2),
-                ))
-                summary[gw_id] = C.STATUS_FAILED
-                if verbose:
-                    print(f"  [door/{cam}/{gw_id}] FAILED: {e}")
-            finally:
-                timer.stamp(gw_id, t0)
+                    summary[gw_id] = C.STATUS_FAILED
+                    if verbose:
+                        print(f"  [door/{cam}/{gw_id}] FAILED: {e}")
 
-    if verbose:
-        n_ok = sum(1 for v in summary.values() if v == C.STATUS_OK)
-        print(f"[FEAT/door] done in {timer.total():.1f}s  ok={n_ok}/{len(summary)}")
+    n_ok = sum(1 for v in summary.values() if v == C.STATUS_OK)
+    timer.log_summary(ok=n_ok, total=len(summary))
     return summary

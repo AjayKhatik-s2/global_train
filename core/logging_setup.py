@@ -71,6 +71,19 @@ def setup_logging(
 
     formatter = logging.Formatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
 
+    # Force UTF-8 stdout/stderr.  The vendored old-production modules (report
+    # generators, feature processors) emit emoji/box-drawing chars in their
+    # print()s; on a non-UTF-8 console (e.g. Windows cp1252) those raise
+    # UnicodeEncodeError and abort a stage.  On the Linux service this was
+    # always UTF-8; reconfiguring here makes local/Windows runs behave the same
+    # without editing any of the ported print() calls.  errors="replace" keeps
+    # a stray glyph from ever crashing a run.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     # File handler (best-effort: if the dir can't be created we still get stdout).
     try:
         os.makedirs(log_dir, exist_ok=True)

@@ -42,10 +42,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core import constants as C
 from core.global_state_loader import GlobalTrainState
+from core.logging_setup import get_logger
 
 from features._common import (
     load_yolo, run_classification, iter_wagon_frames,
-    write_per_wagon_json, empty_payload, FeatureTimer, feature_camera_dir,
+    write_per_wagon_json, empty_payload, FeatureTimer, feature_camera_dir, phase,
 )
 from features._evidence import (
     BestFrameTracker, atomic_camera_evidence,
@@ -54,6 +55,7 @@ from features._evidence import (
 
 
 FEATURE_NAME = "load"
+log = get_logger("features.load")
 
 
 # Legacy threshold from RIGHT_UP_TOP/damage_processor.py:1047
@@ -125,6 +127,7 @@ def _aggregate_camera(
 def _process_wagon_camera(
     model, cache_root: str, gw, camera_id: str, feature_out: str,
     evidence_root: Optional[str], every_nth: int, max_frames: int,
+    timer: Optional[FeatureTimer] = None,
 ) -> str:
     """Aggregate ONE top camera for ONE wagon and write
     load/<CAMERA>/<gw>.json.  Returns the status string.
@@ -142,10 +145,11 @@ def _process_wagon_camera(
         ))
         return C.STATUS_OK
 
-    cls, conf, used, n_l, n_e, b_l, b_e = _aggregate_camera(
-        model, cache_root, gw_id, camera_id,
-        every_nth=every_nth, max_frames=max_frames,
-    )
+    with phase(timer, "inference"):
+        cls, conf, used, n_l, n_e, b_l, b_e = _aggregate_camera(
+            model, cache_root, gw_id, camera_id,
+            every_nth=every_nth, max_frames=max_frames,
+        )
     if used == 0:
         write_per_wagon_json(feature_out, gw_id, empty_payload(
             gw_id, FEATURE_NAME, C.STATUS_NO_FRAMES,
@@ -160,8 +164,8 @@ def _process_wagon_camera(
         winning = b_l if cls == C.LOAD_LOADED else b_e
         if winning.has_data():
             final_dir = os.path.join(evidence_root, gw_id, FEATURE_NAME, camera_id)
-            with atomic_camera_evidence(evidence_root, gw_id, FEATURE_NAME,
-                                        camera_id) as ev_tmp:
+            with phase(timer, "evidence"), atomic_camera_evidence(
+                    evidence_root, gw_id, FEATURE_NAME, camera_id) as ev_tmp:
                 save_jpeg(os.path.join(ev_tmp, "best_frame.jpg"), winning.frame)
                 write_metadata(os.path.join(ev_tmp, "metadata.json"), {
                     "global_id": gw_id, "feature": FEATURE_NAME,
@@ -206,52 +210,54 @@ def run(
     wagon_states/load/<CAMERA>/<gw>.json.  Each camera is INDEPENDENT; Stage 4
     applies RIGHT_UP_TOP-primary / LEFT_UP_TOP-fallback authority."""
     model_path = os.path.join(feature_models_dir, C.MODEL_LOADED)
+    _t_ml = time.time()
     model = load_yolo(model_path)
+    _model_load_s = time.time() - _t_ml
 
     target_cams = [c for c in C.TOP_CAMERAS if (cameras is None or c in cameras)]
     if not target_cams:
         return {}
-    timer = FeatureTimer("load")
+    timer = FeatureTimer(FEATURE_NAME, logger=log,
+                         total_units=len(target_cams) * len(state.wagons))
+    timer.set_model_load(_model_load_s)
     summary: Dict[str, str] = {}
 
-    if model is None and verbose:
-        print(f"[FEAT/load] WARNING: {model_path} missing -- NO_DATA for all wagons.")
-    if verbose:
-        print(f"[FEAT/load] running on {len(state.wagons)} wagons, cameras={target_cams} "
-              f"(per-camera voting, >{_LOADED_RATIO_THRESHOLD:.0%} -> LOADED)")
+    if model is None:
+        log.warning("[FEAT/load] %s missing -- NO_DATA for all wagons.", model_path)
+    log.info("[FEAT/load] start: %d wagons x %d camera(s)=%s  model_load=%.2fs  "
+             "(per-camera voting, >%.0f%% -> LOADED)",
+             len(state.wagons), len(target_cams), target_cams,
+             _model_load_s, _LOADED_RATIO_THRESHOLD * 100)
 
     for cam in target_cams:
         feature_out = feature_camera_dir(output_dir, FEATURE_NAME, cam)
         for gw in state.wagons:
             gw_id = gw.global_id
-            t0 = time.time()
-            try:
-                if model is None:
+            with timer.wagon(gw_id, cam):
+                try:
+                    if model is None:
+                        write_per_wagon_json(feature_out, gw_id, empty_payload(
+                            gw_id, FEATURE_NAME, C.NO_DATA,
+                            camera_id=cam, load_status=C.NO_DATA, load_confidence=0.0,
+                            supporting_cameras=[], error="loaded.pt not present",
+                        ))
+                        summary[gw_id] = C.NO_DATA
+                        continue
+                    summary[gw_id] = _process_wagon_camera(
+                        model, cache_root, gw, cam, feature_out,
+                        evidence_root, every_nth, max_frames, timer=timer,
+                    )
+                except Exception as e:
                     write_per_wagon_json(feature_out, gw_id, empty_payload(
-                        gw_id, FEATURE_NAME, C.NO_DATA,
-                        camera_id=cam, load_status=C.NO_DATA, load_confidence=0.0,
-                        supporting_cameras=[], error="loaded.pt not present",
+                        gw_id, FEATURE_NAME, C.STATUS_FAILED,
+                        camera_id=cam, load_status=C.NO_DATA,
+                        error=f"{type(e).__name__}: {e}",
+                        traceback=traceback.format_exc(limit=2),
                     ))
-                    summary[gw_id] = C.NO_DATA
-                    continue
-                summary[gw_id] = _process_wagon_camera(
-                    model, cache_root, gw, cam, feature_out,
-                    evidence_root, every_nth, max_frames,
-                )
-            except Exception as e:
-                write_per_wagon_json(feature_out, gw_id, empty_payload(
-                    gw_id, FEATURE_NAME, C.STATUS_FAILED,
-                    camera_id=cam, load_status=C.NO_DATA,
-                    error=f"{type(e).__name__}: {e}",
-                    traceback=traceback.format_exc(limit=2),
-                ))
-                summary[gw_id] = C.STATUS_FAILED
-                if verbose:
-                    print(f"  [load/{cam}/{gw_id}] FAILED: {e}")
-            finally:
-                timer.stamp(gw_id, t0)
+                    summary[gw_id] = C.STATUS_FAILED
+                    if verbose:
+                        print(f"  [load/{cam}/{gw_id}] FAILED: {e}")
 
-    if verbose:
-        n_ok = sum(1 for v in summary.values() if v == C.STATUS_OK)
-        print(f"[FEAT/load] done in {timer.total():.1f}s  ok={n_ok}/{len(summary)}")
+    n_ok = sum(1 for v in summary.values() if v == C.STATUS_OK)
+    timer.log_summary(ok=n_ok, total=len(summary))
     return summary

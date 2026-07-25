@@ -101,6 +101,40 @@ MODEL_WAGON_ID_COUNTING = "wagon_id_counting.pt"
 
 
 # -----------------------------------------------------------------------------
+# Model inventory + S3 sync configuration (see core/model_sync.py).
+#
+# Every reconstruction model is ALWAYS required.  Feature models are required
+# only for the ENABLED features of a given run (so a Damage-only run needs just
+# damage.pt + the reconstruction set).  When a required model is missing on
+# disk it is downloaded from:
+#     s3://<MODELS_S3_BUCKET>/<MODELS_S3_PREFIX>/reconstruction/<file>
+#     s3://<MODELS_S3_BUCKET>/<MODELS_S3_PREFIX>/features/<file>
+# Set WAGONEYE_MODELS_S3_BUCKET to enable auto-sync; leave it empty to require
+# the .pt files to already be present locally (e.g. via `git lfs pull`).
+# -----------------------------------------------------------------------------
+
+MODELS_S3_BUCKET = _env("WAGONEYE_MODELS_S3_BUCKET", "")
+MODELS_S3_PREFIX = _env("WAGONEYE_MODELS_S3_PREFIX", "models").strip("/")
+
+# Reconstruction models (always required) + their legacy long-name fallbacks.
+RECON_MODEL_FILES = (
+    MODEL_RIGHT_UP_GAP, MODEL_LEFT_UP_GAP, MODEL_TOP_GAP, MODEL_SIDE_CLASSIFICATION,
+)
+RECON_MODEL_LEGACY = {
+    MODEL_RIGHT_UP_GAP: "right_up_wagon_gap.pt",
+    MODEL_LEFT_UP_GAP:  "left_up_wagon_gap.pt",
+}
+
+# Feature-key -> feature model filename (required only when the feature is on).
+FEATURE_MODEL_BY_KEY = {
+    "door":   MODEL_DOOR_STATE,
+    "load":   MODEL_LOADED,
+    "damage": MODEL_DAMAGE,
+    "ocr":    MODEL_WAGON_ID_COUNTING,
+}
+
+
+# -----------------------------------------------------------------------------
 # Door state vocabulary (from the trained door_state.pt model)
 # -----------------------------------------------------------------------------
 

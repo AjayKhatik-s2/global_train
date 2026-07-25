@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 from collections import Counter
+from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import cv2
@@ -371,20 +372,102 @@ def empty_payload(gw_id: str, feature: str, status: str, **extra) -> Dict[str, A
 
 
 # -----------------------------------------------------------------------------
-# Lightweight per-feature timing helper
+# Stage-3 per-feature timing + progress
 # -----------------------------------------------------------------------------
 
 class FeatureTimer:
-    """Track per-wagon timings inside a processor."""
-    def __init__(self, name: str):
-        self.name = name
-        self.start = time.time()
-        self.per_wagon: Dict[str, float] = {}
+    """Timing + progress instrumentation for one feature processor.
 
-    def stamp(self, gw_id: str, t0: float) -> float:
+    Captures three things a Stage-3 operator wants to see:
+
+      * ``model_load``  -- the one-time YOLO/OCR model-load wall-clock, recorded
+                           via :meth:`set_model_load`.
+      * named ``phases``-- cumulative time spent in each stage across all wagons,
+                           recorded via the :meth:`phase` context manager (the
+                           processors use ``"inference"`` and ``"evidence"``).
+      * ``per_wagon``   -- per-wagon total wall time, recorded via the
+                           :meth:`wagon` context manager, used both for the
+                           progress line and the slowest-wagon summary.
+
+    A progress line is emitted every ``log_every`` wagons (and on the last one),
+    and a single summary line at the end -- both through ``logger`` (a
+    ``logging.Logger``).  With no logger the timer still accumulates numbers but
+    stays silent, so it is safe in tests / library use.
+    """
+
+    def __init__(self, name: str, *, logger=None,
+                 total_units: int = 0, log_every: int = 25):
+        self.name = name
+        self.log = logger
+        self.start = time.time()
+        self.total_units = int(total_units or 0)
+        self.log_every = max(1, int(log_every))
+        self.model_load_s = 0.0
+        self.phase_totals: Dict[str, float] = {}
+        self.per_wagon: Dict[str, float] = {}
+        self._done = 0
+
+    def set_model_load(self, seconds: float) -> None:
+        self.model_load_s = round(float(seconds), 3)
+
+    @contextmanager
+    def phase(self, name: str):
+        """Accumulate wall-clock into the named phase bucket."""
+        t0 = time.time()
+        try:
+            yield
+        finally:
+            self.phase_totals[name] = self.phase_totals.get(name, 0.0) + (time.time() - t0)
+
+    def _record(self, gw_id: str, dt: float, camera_id: Optional[str] = None) -> None:
+        """Record one finished wagon and emit a periodic progress line."""
+        self.per_wagon[gw_id] = self.per_wagon.get(gw_id, 0.0) + dt
+        self._done += 1
+        if self.log is not None and (
+            self._done % self.log_every == 0 or self._done == self.total_units):
+            tot = f"/{self.total_units}" if self.total_units else ""
+            cam = f" {camera_id}" if camera_id else ""
+            self.log.info("[FEAT/%s] progress %d%s%s  last=%s %.2fs  elapsed=%.1fs",
+                          self.name, self._done, tot, cam, gw_id, dt, self.total())
+
+    @contextmanager
+    def wagon(self, gw_id: str, camera_id: Optional[str] = None):
+        """Time one wagon's processing and emit a periodic progress line."""
+        t0 = time.time()
+        try:
+            yield
+        finally:
+            self._record(gw_id, time.time() - t0, camera_id)
+
+    # -- back-compat call site: timer.stamp(gw_id, t0[, camera_id]) in a finally --
+    def stamp(self, gw_id: str, t0: float, camera_id: Optional[str] = None) -> float:
         dt = time.time() - t0
-        self.per_wagon[gw_id] = round(dt, 3)
+        self._record(gw_id, dt, camera_id)
         return dt
 
     def total(self) -> float:
         return time.time() - self.start
+
+    def log_summary(self, *, ok: Optional[int] = None,
+                    total: Optional[int] = None) -> None:
+        """Emit one structured DONE line with model-load, per-phase totals, and
+        the three slowest wagons."""
+        if self.log is None:
+            return
+        phases = "  ".join(f"{k}={v:.1f}s"
+                           for k, v in sorted(self.phase_totals.items())) or "-"
+        slow = sorted(self.per_wagon.items(), key=lambda x: x[1], reverse=True)[:3]
+        slow_s = ", ".join(f"{g}:{s:.2f}s" for g, s in slow) or "-"
+        okpart = f"  ok={ok}/{total}" if ok is not None else ""
+        self.log.info(
+            "[FEAT/%s] DONE total=%.1fs  model_load=%.2fs  %s%s  slowest=[%s]",
+            self.name, self.total(), self.model_load_s, phases, okpart, slow_s)
+
+
+def phase(timer: Optional[FeatureTimer], name: str):
+    """Return ``timer.phase(name)`` when a timer is present, else a no-op context.
+
+    Lets a per-wagon helper accept an optional timer and write
+    ``with phase(timer, "inference"):`` without a None-check at every call site.
+    """
+    return timer.phase(name) if timer is not None else nullcontext()

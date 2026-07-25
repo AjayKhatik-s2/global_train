@@ -423,6 +423,10 @@ def stage_reports(manifest: BatchManifest, ctx: RunContext, *, final: bool,
             wagon_states_root=states_root, cache_root=cache_root,
             per_camera_tracking_path=pcf_path, output_dir=reports_root,
             batch_key=manifest.batch_key, logo_path=CFG.LOGO_PATH,
+            video_paths=video_paths,
+            source_video_urls={c: manifest.cameras[c].s3_url
+                               for c in manifest.present_cameras()
+                               if manifest.cameras[c].bucket != "__local__"},
             cameras=render_cams, verbose=ctx.verbose,
         )
     except Exception as e:
@@ -499,6 +503,9 @@ def stage_finalize(manifest: BatchManifest, ctx: RunContext) -> None:
     upload_urls: Dict[str, Any] = dict(prior.get("upload_urls") or {}) if already_uploaded else {}
     camera_report_hashes = dict(prior.get("camera_report_hashes") or {})
     processed_video_hashes = dict(prior.get("processed_video_hashes") or {})
+    # Old-layout delivery bookkeeping (idempotent daily counter across re-entries).
+    _legacy: Dict[str, Any] = {"counter": prior.get("legacy_counter"),
+                               "report_name": prior.get("legacy_report_name")}
 
     def _mk(uploaded: bool, email_sent: bool, email_status: str) -> Dict[str, Any]:
         return {
@@ -516,6 +523,8 @@ def stage_finalize(manifest: BatchManifest, ctx: RunContext) -> None:
             "email_status": email_status,
             "email_sent": email_sent,
             "email_idempotency_key": idem_key,
+            "legacy_counter": _legacy.get("counter"),
+            "legacy_report_name": _legacy.get("report_name"),
             "cameras_present": meta.get("cameras_present") or manifest.present_cameras(),
             "cameras_missing_final": meta.get("cameras_missing_final") or [],
         }
@@ -552,6 +561,41 @@ def stage_finalize(manifest: BatchManifest, ctx: RunContext) -> None:
             uploaded = True
         except Exception as e:
             log.error("[FINALIZE %s] delivery failed: %s", manifest.batch_key, e)
+
+    # ---- OLD-PRODUCTION output layout (camera_reports/ + combined_reports/) ----
+    # Always build the old-structure tree locally so --local-only runs are
+    # directly comparable to old production; upload it under the old bucket-root
+    # keys when S3 is available.  The daily counter is reused across re-entries.
+    if terminal != LifecycleState.FAILED:
+        try:
+            from delivery import legacy_layout as LL
+            state_for_legacy = _load_sealed_state(manifest, ctx)
+            legacy_res = LL.deliver(
+                s3_client=ctx.s3_client,
+                batch_root=root, batch_key=manifest.batch_key,
+                state=state_for_legacy, unified=unified,
+                evidence_root=os.path.join(root, CFG.DIR_EVIDENCE),
+                wagon_states_root=os.path.join(root, CFG.DIR_WAGON_STATES),
+                per_camera_tracking_path=os.path.join(
+                    root, CFG.DIR_GLOBAL_STATE, "per_camera_tracking.json"),
+                processed_root=os.path.join(root, CFG.DIR_PROCESSED_VIDEOS),
+                camera_pdf_paths=camera_pdf_paths,
+                combined_pdf_path=report_pdf_path,
+                source_video_urls={c: manifest.cameras[c].s3_url
+                                   for c in manifest.present_cameras()
+                                   if manifest.cameras[c].bucket != "__local__"},
+                missing_cameras=(meta.get("cameras_missing_final") or []),
+                counter=_legacy.get("counter"),
+                skip_upload=(ctx.skip_upload or ctx.s3_client is None),
+            )
+            _legacy["counter"] = legacy_res.get("counter")
+            _legacy["report_name"] = legacy_res.get("report_name")
+            if legacy_res.get("combined_url"):
+                upload_urls["legacy_combined"] = legacy_res["combined_url"]
+        except Exception as e:
+            log.error("[FINALIZE %s] legacy layout delivery failed: %s",
+                      manifest.batch_key, e)
+
     # Persist the marker AFTER upload, BEFORE email, so a crash here resumes
     # without re-uploading and still sends the email.
     FIN.write(root, _mk(uploaded, already_emailed, prior.get("email_status") or "pending"))

@@ -203,6 +203,27 @@ ACTIVE_BATCH_POLL_INTERVAL = int(_env_float("WAGONEYE_ACTIVE_BATCH_POLL_INTERVAL
 # IGNORE (default) -> log + drop; the sealed report is never reopened.
 LATE_CAMERA_POLICY = _env_str("WAGONEYE_LATE_CAMERA_POLICY", "IGNORE").upper()
 
+# -----------------------------------------------------------------------------
+# Pipeline source -- WHAT the orchestrator consumes (see core.pipeline_source).
+#
+#   trimmed (default) : the input prefixes already hold trimmed train clips;
+#                       the orchestrator is a pure consumer (two-service topology
+#                       or manual uploads).
+#   raw               : only raw CCTV exists; the orchestrator owns an
+#                       ExtractionManager that discovers raw video, detects train
+#                       completion, runs the extractor, and produces the trimmed
+#                       clips before consuming them (single-service topology).
+#
+# This describes the source of the input, not the mechanism -- threads/services
+# are the orchestrator's concern.  Override with WAGONEYE_PIPELINE_SOURCE.
+from core.pipeline_source import PipelineSource   # noqa: E402
+
+PIPELINE_SOURCE = PipelineSource.resolve()
+
+# Poll cadence (seconds) for the ExtractionManager's raw->trimmed sweeps (and the
+# standalone extraction service).  Only consulted when PIPELINE_SOURCE is 'raw'.
+EXTRACTION_POLL_INTERVAL = int(_env_float("WAGONEYE_EXTRACTION_POLL_INTERVAL", 60))
+
 
 # -----------------------------------------------------------------------------
 # Startup configuration validation + redacted summary
@@ -290,6 +311,7 @@ def startup_summary(*, mode: str) -> str:
         f"  upload_interim_reports   : {UPLOAD_INTERIM_REPORTS}",
         f"  email_interim_reports    : {EMAIL_INTERIM_REPORTS}",
         f"  late_camera_policy       : {LATE_CAMERA_POLICY}",
+        f"  pipeline_source          : {PIPELINE_SOURCE.value}",
         f"  poll_interval_s          : {ACTIVE_BATCH_POLL_INTERVAL}",
         f"  s3_output_bucket         : {C.S3_OUTPUT_BUCKET}",
         f"  s3_input_bucket          : {C.S3_INPUT_BUCKET}",

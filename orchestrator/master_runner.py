@@ -26,7 +26,6 @@ import os
 import signal
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -52,10 +51,9 @@ from core.unified_wagon_state import UnifiedWagonState, summarize_wagons
 
 from reconstruction import runner as reconstruction_runner
 from materializer import wagon_cache_builder
-from features.door   import processor as door_proc
-from features.load   import processor as load_proc
-from features.damage import processor as damage_proc
-from features.ocr    import processor as ocr_proc
+from orchestrator.feature_scheduler import (
+    run_features_wagon_wise, FEATURE_CAMERAS, WAGON_FEATURE_ORDER,
+)
 from fusion import wagon_state_builder
 from reporting import combined_train_report, camera_reports
 from rendering import feature_overlay_renderer
@@ -298,21 +296,6 @@ def process_batch(
              feature_config.enabled_keys() or "—",
              feature_config.disabled_keys() or "—")
     _print_feature_config(feature_config, header="  feature config:")
-    feature_kwargs = dict(
-        state=recon.state,
-        cache_root=cache_root,
-        feature_models_dir=feat_models_dir,
-        output_dir=states_root,
-        evidence_root=evidence_root,
-        verbose=verbose,
-    )
-
-    def _run_feature(name, fn):
-        try:
-            return fn(**feature_kwargs)
-        except Exception as e:
-            log.error("[STAGE3/%s] CRASHED: %s", name, e, exc_info=True)
-            return {}
 
     def _mark_disabled(name):
         """Write a DISABLED_BY_USER sentinel JSON for every wagon of a
@@ -332,30 +315,28 @@ def process_batch(
                  name, len(summary))
         return summary
 
-    # 1) Load first (deterministic input for damage's load-aware filter).
-    if feature_config.is_enabled("load"):
-        out.feature_summary["load"] = _run_feature("load", load_proc.run)
-    else:
-        out.feature_summary["load"] = _mark_disabled("load")
-
-    # 2) Then door / ocr / damage -- only the enabled ones run (in parallel).
-    all_parallel = {
-        "door":   door_proc.run,
-        "ocr":    ocr_proc.run,
-        "damage": damage_proc.run,
-    }
-    parallel_targets = {n: fn for n, fn in all_parallel.items()
-                        if feature_config.is_enabled(n)}
-    for name in all_parallel:
-        if name not in parallel_targets:
+    # Stage 3 runs through the SINGLE shared WAGON-WISE scheduler
+    # (orchestrator/feature_scheduler) -- the exact same one the incremental
+    # `--auto` path uses -- so scheduling can never diverge between modes.
+    # Disabled features get their DISABLED_BY_USER sentinels; enabled ones with
+    # >=1 present camera are handed to the scheduler as work items.
+    present = [c for c in C.ALL_CAMERAS if c in video_paths]
+    feature_cameras: Dict[str, list] = {}
+    for name in WAGON_FEATURE_ORDER:
+        if not feature_config.is_enabled(name):
             out.feature_summary[name] = _mark_disabled(name)
-
-    if parallel_targets:
-        with ThreadPoolExecutor(max_workers=len(parallel_targets)) as ex:
-            futs = {ex.submit(_run_feature, name, fn): name
-                    for name, fn in parallel_targets.items()}
-            for f in as_completed(futs):
-                out.feature_summary[futs[f]] = f.result()
+            continue
+        cams = [c for c in FEATURE_CAMERAS[name] if c in present]
+        if cams:
+            feature_cameras[name] = cams
+        else:
+            out.feature_summary[name] = {}          # enabled but no present camera
+    summ = run_features_wagon_wise(
+        state=recon.state, cache_root=cache_root, feat_models_dir=feat_models_dir,
+        states_root=states_root, evidence_root=evidence_root,
+        feature_cameras=feature_cameras, verbose=verbose, log=log,
+    )
+    out.feature_summary.update(summ)
 
     log.info("STAGE 3 complete (%.1fs)", time.time() - _t)
 

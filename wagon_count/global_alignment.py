@@ -227,6 +227,11 @@ def fuse_master_timeline(
     config: Optional[Dict[str, Any]] = None,
     verbose: bool = True,
 ) -> Tuple[List[GapEvent], List[GapCorrection], Dict[str, List[GapEvent]]]:
+    """DEPRECATED / NOT INVOKED.  Support-gap insertion is disabled under the
+    canonical-master rule: RIGHT_UP is the sole authority for the wagon count
+    and numbering (`assemble_global_train_state` builds from master gaps only).
+    Retained for reference; do not call it to build wagons -- doing so would let
+    support cameras change the canonical count."""
     cfg = dict(PHASE1_DEFAULTS)
     if config:
         cfg.update(config)
@@ -464,38 +469,74 @@ def assemble_global_train_state(
             print(f"[FUSE] support({st.camera_id}) wagons={st.local_wagon_count} "
                   f"gaps={len(st.gaps)}")
 
+    # =====================================================================
+    # CANONICAL RULE -- the master (RIGHT_UP) is the SOLE authority for the
+    # wagon COUNT and the wagon NUMBERING.  Global Wagons are reconstructed
+    # from the MASTER's gaps ONLY; support cameras can NEVER add, delete, or
+    # renumber a wagon.  They are matched here purely to (a) report how many
+    # canonical wagons each corroborates and (b) surface any extra detection
+    # as UNMATCHED EVIDENCE.  GW_i therefore corresponds one-to-one with the
+    # master's wagon sequence.  (Ownership requirements 1-8.)
+    #
+    # `fuse_master_timeline` / `decide_inserted_gaps` (support-gap insertion)
+    # are intentionally NOT invoked -- they are retained only for reference.
+    # =====================================================================
+    support_ids = [st.camera_id for st in support_tracks]
     fallback_used = False
     fallback_reason = ""
-
     try:
-        fused_gaps, corrections, _leftovers = fuse_master_timeline(
-            master_tracks, support_tracks, config=cfg, verbose=verbose,
-        )
         wagons = build_global_wagons(
-            fused_gaps,
+            sorted(master_tracks.gaps, key=lambda g: g.center_time),
             master_total_frames=master_tracks.total_frames,
             master_fps=master_tracks.fps,
             initial_classifications=initial_classifications,
-            support_camera_ids=[st.camera_id for st in support_tracks],
+            support_camera_ids=support_ids,
             master_camera_id=master_tracks.camera_id,
         )
     except Exception as e:
         fallback_used = True
-        fallback_reason = f"fusion error: {type(e).__name__}: {e}"
+        fallback_reason = f"master wagon build error: {type(e).__name__}: {e}"
         if verbose:
-            print(f"[FUSE] {fallback_reason} -- falling back to pure RIGHT_UP")
-        corrections = []
-        wagons = build_wagons_pure_master(master_tracks, initial_classifications)
-
-    if not wagons:
+            print(f"[FUSE] {fallback_reason}")
+        wagons = []
+    if not wagons and master_tracks.total_frames > 0 and master_tracks.gaps:
         fallback_used = True
         if not fallback_reason:
-            fallback_reason = "no wagons produced; using pure RIGHT_UP build"
-        wagons = build_wagons_pure_master(master_tracks, initial_classifications)
-        corrections = []
+            fallback_reason = "master produced no wagons"
+
+    total = len(wagons)
+
+    # ---- support corroboration audit (NEVER changes count or numbering) ----
+    if verbose:
+        print(f"[STAGE1] Master camera: {master_tracks.camera_id}")
+        print(f"[STAGE1] Canonical wagon count: {total} ({master_tracks.camera_id})")
+    for st in support_tracks:
+        matched, leftover = match_support_to_master(
+            master_tracks.gaps, st.gaps,
+            match_time_window_sec=cfg["match_time_window_sec"],
+            match_min_iou=cfg["match_min_iou"],
+        )
+        # distinct master boundaries this camera corroborated.  Each master
+        # boundary the support MISSED is one canonical wagon it did not
+        # distinctly confirm, so matched_wagons drops by exactly that many.
+        boundaries_matched = len(set(matched.values()))
+        missing_boundaries = max(0, len(master_tracks.gaps) - boundaries_matched)
+        matched_wagons = max(0, total - missing_boundaries)
+        if matched_wagons < total:
+            # requirement 6: wagon stays (it is the master's); the camera is
+            # simply marked as missing evidence for the wagons it did not see.
+            per_status[st.camera_id] = "missing_evidence"
+        if verbose:
+            # requirement 5: extra support detections are UNMATCHED EVIDENCE,
+            # never a new Global Wagon.
+            extra = f"  (+{len(leftover)} unmatched evidence)" if leftover else ""
+            print(f"[STAGE1] {st.camera_id} matched: {matched_wagons}/{total}{extra}")
+    if verbose:
+        print(f"[STAGE1] Final Global Train: {total} wagons "
+              f"({master_tracks.camera_id} canonical)")
 
     state = GlobalTrainState(
-        total_wagons=len(wagons),
+        total_wagons=total,
         wagons=wagons,
         master_camera=master_tracks.camera_id,
         master_fps=master_tracks.fps,
@@ -503,7 +544,8 @@ def assemble_global_train_state(
         per_camera_local_counts=per_local_counts,
         per_camera_gap_counts=per_gap_counts,
         per_camera_status=per_status,
-        corrections_applied=corrections,
+        # support cameras never insert a gap under the canonical rule
+        corrections_applied=[],
         fallback_used=fallback_used,
         fallback_reason=fallback_reason,
     )

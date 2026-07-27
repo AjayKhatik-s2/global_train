@@ -46,24 +46,36 @@ def test_master_id_and_fusion_consensus():
     assert st.master_camera == CAMERA_LEFT_UP
     assert st.wagons[0].supporting_cameras[0] == CAMERA_LEFT_UP
 
-    # [C1] one support camera can NEVER recover a gap
+    # [C1] CANONICAL RULE: support cameras can NEVER change the wagon count or
+    # numbering.  RIGHT_UP is the sole authority -- support-gap insertion is
+    # disabled, so `corrections_applied` is always empty and total_wagons equals
+    # the master-only reconstruction regardless of how many support cameras agree.
     m2 = LocalCameraTracks(camera_id=CAMERA_RIGHT_UP, video_path="x", fps=fps,
                            total_frames=N, gaps=[gap(CAMERA_RIGHT_UP, 10),
                                                  gap(CAMERA_RIGHT_UP, 30)])
+    st_master_only = ga.assemble_global_train_state(
+        master_tracks=m2, support_tracks=[], initial_classifications=[], verbose=False)
+    canonical = st_master_only.total_wagons
+
+    # one support camera with an extra gap RIGHT_UP never saw -> no recovery
     s1 = LocalCameraTracks(camera_id=CAMERA_LEFT_UP, video_path="x", fps=fps,
                            total_frames=N, gaps=[gap(CAMERA_LEFT_UP, 50)])
     st2 = ga.assemble_global_train_state(master_tracks=m2, support_tracks=[s1],
                                          initial_classifications=[], verbose=False)
     assert len(st2.corrections_applied) == 0
+    assert st2.total_wagons == canonical            # support cannot ADD a wagon
 
-    # [C1] two agreeing support cameras recover exactly one gap
+    # two agreeing support cameras STILL cannot recover a gap under the rule
     s_lt = LocalCameraTracks(camera_id=CAMERA_LEFT_UP, video_path="x", fps=fps,
                              total_frames=N, gaps=[gap(CAMERA_LEFT_UP, 50)])
     s_rt = LocalCameraTracks(camera_id=CAMERA_RIGHT_UP_TOP, video_path="x", fps=fps,
                              total_frames=N, gaps=[gap(CAMERA_RIGHT_UP_TOP, 50)])
     st3 = ga.assemble_global_train_state(master_tracks=m2, support_tracks=[s_lt, s_rt],
                                          initial_classifications=[], verbose=False)
-    assert len(st3.corrections_applied) == 1
+    assert len(st3.corrections_applied) == 0        # NO support insertion
+    assert st3.total_wagons == canonical            # count stays RIGHT_UP canonical
+    # GW ids are exactly the master sequence, one-to-one
+    assert [w.global_id for w in st3.wagons] == [f"GW_{i}" for i in range(1, canonical + 1)]
 
 
 # -----------------------------------------------------------------------------

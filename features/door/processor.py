@@ -54,7 +54,7 @@ from core import constants as C
 from core.global_state_loader import GlobalTrainState
 from core.logging_setup import get_logger
 from core.frame_quality import (
-    detection_quality, snapshot_score, expand_bbox, _DOOR_BBOX_EXPAND_FRAC,
+    detection_quality, snapshot_score,
 )
 
 from features._common import (
@@ -176,10 +176,9 @@ def _run_tracker_one_camera(
                 bb = [float(v) for v in t.tlbr]
             except Exception:
                 continue
-            # ITEM 4: expand the persisted overlay box so the processed-video
-            # rectangle visually contains the WHOLE door (matches the expanded
-            # evidence crop below).  Clipped to the frame; still a clean rect.
-            bb = expand_bbox(bb, _DOOR_BBOX_EXPAND_FRAC, frame_w, frame_h)
+            # Old production drew the RAW tracker box (track.tlbr) with no
+            # expansion (door_processor.py:_annotate_frame); the processed-video
+            # rectangle must match it exactly, so the box is persisted raw.
             try:
                 vel = [float(t.velocity[0]), float(t.velocity[1])]
             except Exception:
@@ -279,15 +278,12 @@ def _run_tracker_one_camera(
             crop_q = detection_quality(frame, bbox_list)
             sc = snapshot_score(bbox_list, float(conf), crop_q,
                                 frame_w, frame_h)
-            # ITEM 4: persist an EXPANDED box so the evidence crop + annotated
-            # frame + metadata bbox visually contain the WHOLE door, consistent
-            # with the expanded overlay box.
-            bbox_store = expand_bbox(bbox_list, _DOOR_BBOX_EXPAND_FRAC,
-                                     frame_w, frame_h)
+            # Store the RAW detection box -- old production annotated the
+            # snapshot + recorded the bbox with no expansion (door_processor.py).
             bucket = cands.setdefault(canon, BestFrameTracker())
             if sc > bucket.score:
                 bucket.update(
-                    score=sc, frame=frame, bbox=bbox_store, frame_idx=fi,
+                    score=sc, frame=frame, bbox=bbox_list, frame_idx=fi,
                     state=canon, confidence=float(conf),
                     raw_class=cls_name, quality=float(crop_q),
                 )
@@ -569,8 +565,42 @@ def run(
 
     # Shared per-process helpers (loaded once across wagons + cameras)
     illumination = IlluminationProcessor(IlluminationConfig())
-    geo_prior    = GeometricShapePrior(GeometricPriorConfig())
-    tracker_cfg  = TrackerConfig()
+    # PORTED VERBATIM from old production door_processor.py:394-405 -- the
+    # GeometricShapePrior/DoorTracker CODE is byte-identical to production, but
+    # production ran them with these RELAXED settings, NOT the library defaults.
+    # The library defaults (require_vertical_edges / require_border_completeness
+    # = True, stricter aspect/edge/structure) rejected almost every LEFT_UP door
+    # (side-camera doors hug the frame edge), which is why LEFT_UP showed no
+    # detections.  These are the exact production values ("VERY relaxed; only
+    # reject obviously non-door shapes; let the tracker handle ambiguous cases").
+    geo_prior = GeometricShapePrior(GeometricPriorConfig(
+        min_aspect_ratio=0.15,
+        max_aspect_ratio=2.0,
+        min_vertical_edge_ratio=0.8,
+        min_edge_density=0.01,
+        min_border_edge_ratio=0.03,
+        min_sides_with_edges=1,
+        min_structure_score=0.2,
+        require_aspect_ratio=True,
+        require_vertical_edges=False,      # DISABLED in production (too strict)
+        require_border_completeness=False,  # DISABLED in production (too strict)
+    ))
+    # PORTED from old production door_processor.py:364-374 + process_door_detection
+    # thresholds (open_conf=0.60, default_conf=0.50).  Production ran a RELAXED
+    # tracker (n_init=2, min_hits=2, reduced confirmation frames); the library
+    # defaults (0.80/0.68, n_init=3, min_hits=3, 5-frame confirmation) suppressed
+    # valid doors.
+    tracker_cfg = TrackerConfig(
+        open_confidence_threshold=0.60,
+        closed_confidence_threshold=0.50,
+        max_age=30,
+        n_init=2,
+        min_hits_for_decision=2,
+        open_confirmation_frames=3,
+        closed_confirmation_frames=4,
+        new_id_delay_frames=4,
+        prediction_buffer_size=30,
+    )
     merger_cfg   = MergeConfig()
 
     if yolo_model is None:

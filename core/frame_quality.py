@@ -33,26 +33,18 @@ import numpy as np
 # --- legacy constants (verbatim from door_processor.py) ----------------------
 
 _EDGE_MARGIN_RATIO  = 0.08    # _is_edge_detection: within 8% of any edge
-_AREA_OPTIMAL_RATIO = 0.28    # full-door area target (raised from legacy 0.15 so
-                              # a larger door keeps scoring up to ~28% of frame)
+_AREA_OPTIMAL_RATIO = 0.15    # EXACT old production value: 15% of frame = perfect
 _EDGE_PENALTY       = 0.3     # 70% score reduction for edge-hugging boxes
 
-# _score_detection term weights.  ITEM 5: bias evidence selection toward the
-# LARGEST visible (full) door -- area weight raised 2.0 -> 3.5 so a maximal-area
-# door dominates the 2.5 centring weight, plus a small un-saturated tie-break so
-# the physically largest door wins among equally-full candidates.  The edge
-# penalty (0.3) and crop-quality term are UNCHANGED, so blurry / edge frames are
-# still suppressed; there is still NO hard rejection gate.
-_W_AREA          = 3.5
+# _score_detection term weights -- EXACT old production values (door_processor.py
+# _score_detection): area 2.0, centre 2.5, confidence 1.0, quality 0.5.  A prior
+# revision biased this toward the largest door (area peak 0.28, weight 3.5, plus
+# a raw-area tie-break); that changed WHICH frame was selected vs old production,
+# so it has been reverted to reproduce the identical snapshot choice.
+_W_AREA          = 2.0
 _W_CENTER        = 2.5
 _W_CONF          = 1.0
 _W_QUALITY       = 0.5
-_W_AREA_TIEBREAK = 0.5
-
-# ITEM 4: total growth applied to the chosen door box (7.5% per side, clipped to
-# frame) so the persisted overlay box + evidence crop visually contain the WHOLE
-# door.  Still a clean axis-aligned rectangle (legacy draw parity preserved).
-_DOOR_BBOX_EXPAND_FRAC = 0.15
 
 Bbox = Sequence[float]
 
@@ -104,27 +96,20 @@ def snapshot_score(
     bbox: Bbox, confidence: float, quality: float,
     frame_w: int, frame_h: int,
 ) -> float:
-    """Snapshot scorer (legacy ``_score_detection`` + ITEM 5 max-area bias).
+    """Snapshot scorer -- EXACT port of old production ``_score_detection``:
 
-    ``(area*_W_AREA + raw_area*_W_AREA_TIEBREAK + center_h*_W_CENTER
-       + conf*_W_CONF + quality*_W_QUALITY) * edge_penalty``
+    ``(area*2.0 + center_h*2.5 + conf*1.0 + quality*0.5) * edge_penalty``
 
-    Centre proximity is horizontal-only (the door crosses the frame
-    horizontally as the train passes).  DIVERGES from the legacy port: the area
-    term now peaks at ~28% of the frame (was 15%) and carries weight 3.5 (was
-    2.0) plus a small un-saturated max-area tie-break, so the LARGEST visible
-    full-door frame dominates.  The edge-hugging penalty (0.3) and the
-    crop-quality term are UNCHANGED, so blurry / edge frames are still
-    suppressed; there is still NO hard rejection gate.
+    with the area term peaking at 15% of the frame and a 0.3 edge-hugging
+    penalty.  Centre proximity is horizontal-only (the door crosses the frame
+    horizontally as the train passes).  No hard rejection gate (quality is a
+    soft down-weight only), matching production.
     """
     x1, y1, x2, y2 = (float(bbox[0]), float(bbox[1]),
                       float(bbox[2]), float(bbox[3]))
     frame_area = max(1.0, float(frame_w) * float(frame_h))
     bbox_area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
     area_score = min(1.0, bbox_area / (frame_area * _AREA_OPTIMAL_RATIO))
-    # Un-saturated raw-area fraction so that, among boxes that all hit the
-    # optimal-area cap, the physically largest door still wins the tie.
-    raw_area_frac = min(1.0, bbox_area / frame_area)
 
     frame_cx = max(1.0, frame_w / 2.0)
     cx = (x1 + x2) / 2.0
@@ -135,7 +120,6 @@ def snapshot_score(
 
     score = (
         area_score * _W_AREA
-        + raw_area_frac * _W_AREA_TIEBREAK
         + center_score * _W_CENTER
         + float(confidence) * _W_CONF
         + float(quality) * _W_QUALITY
@@ -143,27 +127,7 @@ def snapshot_score(
     return float(score)
 
 
-def expand_bbox(bbox: Bbox, frac: float, frame_w: int, frame_h: int) -> list:
-    """Grow an axis-aligned ``[x1,y1,x2,y2]`` box by ``frac`` (total, split
-    evenly per side) about its centre, clipped to ``[0, frame_w] x [0, frame_h]``.
-
-    Returns a plain 4-float list -- still a clean rectangle (no shape change, so
-    legacy draw parity holds).  Degenerate / missing boxes are returned as-is.
-    Used to make the chosen door box visually contain the WHOLE door in both the
-    processed-video overlay and the evidence crop.
-    """
-    if bbox is None or len(bbox) != 4:
-        return list(bbox) if bbox is not None else bbox
-    if not frame_w or not frame_h:
-        return [float(v) for v in bbox]
-    x1, y1, x2, y2 = (float(bbox[0]), float(bbox[1]),
-                      float(bbox[2]), float(bbox[3]))
-    dx = max(0.0, x2 - x1) * frac / 2.0
-    dy = max(0.0, y2 - y1) * frac / 2.0
-    nx1 = max(0.0, x1 - dx)
-    ny1 = max(0.0, y1 - dy)
-    nx2 = min(float(frame_w), x2 + dx)
-    ny2 = min(float(frame_h), y2 + dy)
-    if nx2 <= nx1 or ny2 <= ny1:
-        return [x1, y1, x2, y2]
-    return [nx1, ny1, nx2, ny2]
+# NOTE: an earlier revision expanded the chosen door box by 15% ("ITEM 4") for
+# both the processed-video overlay and the evidence crop.  Old production drew
+# and stored the RAW box, so that expansion was removed for exact annotation
+# parity; the helper is intentionally gone (no expansion anywhere).

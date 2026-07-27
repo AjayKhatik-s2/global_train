@@ -119,7 +119,7 @@ BATCH_SUBDIRS = (
 # Device resolution (CPU / CUDA) -- centralized so every model load and every
 # inference call selects the same device deterministically.  Before the
 # migration nothing branched on torch.cuda.is_available(); ultralytics guessed
-# and easyocr was hard-forced to GPU.  These helpers make the choice explicit
+# and the OCR engine was hard-forced to GPU.  These helpers make the choice explicit
 # and give a clean CPU fallback on a CPU-only EC2 instance while preserving
 # the exact GPU behaviour on GPU hosts.
 # -----------------------------------------------------------------------------

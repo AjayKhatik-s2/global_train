@@ -86,7 +86,8 @@ wagon_eye_v4/
 │   ├── door/processor.py              door_state.pt
 │   ├── load/processor.py              loaded.pt
 │   ├── damage/processor.py            damage.pt
-│   └── ocr/processor.py               wagon_id_counting.pt + easyocr
+│   └── ocr/processor.py               wagon_id_counting.pt + AWS Rekognition
+│                                       (RIGHT_UP only; band-selected frames)
 ├── fusion/wagon_state_builder.py      Stage 4
 ├── rendering/
 │   └── feature_overlay_renderer.py    Stage 4b (visualization-only;
@@ -168,7 +169,10 @@ batch_outputs/<batch_key>/
 │   ├── GW_1/door/{left_best,left_crop,right_best,right_crop}.jpg
 │   │       + metadata.json
 │   ├── GW_1/damage/{track_1,track_1_crop,...}.jpg + metadata.json
-│   ├── GW_1/ocr/{best_frame,number_crop}.jpg + metadata.json
+│   ├── GW_1/ocr/{number_sheet,best_frame,number_crop}.jpg + metadata.json
+│   │       (number_sheet.jpg IS the image posted to Rekognition -- the
+│   │        dashboard's ocr_frame_s3_url, so a number can be verified
+│   │        against its own OCR input; engines get loco_NNN_*.jpg instead)
 │   ├── GW_1/load/best_frame.jpg + metadata.json
 │   └── GW_2/...
 ├── processed_videos/                  rich feature-overlay videos

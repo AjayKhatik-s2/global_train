@@ -66,7 +66,7 @@ REQUIRED_IMPORTS = [
 ]
 # Declared in requirements.txt but not imported by the current code paths
 # (kept for parity / future use).  Missing => WARN, never a blocker.
-OPTIONAL_IMPORTS = ["easyocr", "filterpy", "imageio_ffmpeg"]
+OPTIONAL_IMPORTS = ["filterpy", "imageio_ffmpeg"]
 
 
 def check_deps(res: Result) -> None:
@@ -83,10 +83,8 @@ def check_deps(res: Result) -> None:
             importlib.import_module(m)
             print(f"  [{_ok('PASS')}] {m} (optional)")
         except Exception:
-            hint = ("needed only for the OCR feature; pip install easyocr"
-                    if m == "easyocr" else
-                    "declared in requirements.txt but not imported by current code")
-            res.warn(f"{m} (optional)", hint)
+            res.warn(f"{m} (optional)",
+                     "declared in requirements.txt but not imported by current code")
 
 
 def check_dirs(res: Result) -> None:

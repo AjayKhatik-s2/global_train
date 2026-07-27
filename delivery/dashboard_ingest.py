@@ -258,6 +258,23 @@ def _evidence_file(evidence_root: str, gw: str, feature: str, camera: str,
     return p if os.path.isfile(p) else None
 
 
+def _ocr_input_url(url_maker, evidence_root: str, gw: str, camera: str,
+                   meta: Dict[str, Any], default_name: str) -> Optional[str]:
+    """URL of the image Rekognition was actually asked to read.
+
+    The OCR feature records that filename as `ocr_input_image`; `default_name`
+    covers evidence written before that key existed.  Falls back to the legacy
+    crop/frame pair so a wagon never loses its thumbnail."""
+    for name in (meta.get("ocr_input_image"), default_name,
+                 "number_crop.jpg", "best_frame.jpg"):
+        if not name:
+            continue
+        url = url_maker.url(evidence_root, gw, "ocr", camera, str(name))
+        if url:
+            return url
+    return None
+
+
 class _UrlMaker:
     """Turn a local evidence JPEG into a dashboard-usable HTTPS URL.
 
@@ -309,7 +326,35 @@ _SIDE_GALLERY = ("door/{side}_best.jpg", "door/{side}_crop.jpg",
                  "ocr/best_frame.jpg", "ocr/number_crop.jpg")
 _TOP_GALLERY = ("load/best_frame.jpg", "damage/track_1.jpg",
                 "damage/track_2.jpg", "damage/track_3.jpg")
-_POSITIONS = ("start", "mid1", "mid2", "end")
+# Side galleries carry four frames, top galleries three (matches the dashboard's
+# per-flavour expectation).
+_POSITIONS_SIDE = ("start", "mid1", "mid2", "end")
+_POSITIONS_TOP = ("start", "mid1", "end")
+_POSITIONS = _POSITIONS_SIDE          # back-compat alias
+
+# Canonical door state -> dashboard problem-frame / door_status vocabulary.
+_DOOR_PROBLEM_TYPE = {
+    C.DOOR_OPEN:    "open_door",
+    C.DOOR_CLOSED:  "closed_door",
+    C.DOOR_PARTIAL: "partially_closed",
+    C.DOOR_DAMAGED: "damage",
+}
+_DOOR_STATUS = {
+    C.DOOR_OPEN:    "open",
+    C.DOOR_CLOSED:  "closed",
+    C.DOOR_PARTIAL: "partially_closed",
+    C.DOOR_DAMAGED: "damage",
+}
+
+# v4 damage class names -> the dashboard's short vocabulary.  `floor_dmg_probable`
+# has no v4 producer (the damage tracker emits confirmed tracks only) but the key
+# is still reported as 0 so the dashboard's shape is stable.
+_DAMAGE_CLASS_TO_DASH = {
+    "floor_damage":      "floor_dmg",
+    "inner_wall_damage": "inner_wall_dmg",
+}
+_TOP_PROBLEM_TYPES = ("floor_dmg", "inner_wall_dmg", "floor_dmg_probable")
+_SIDE_PROBLEM_TYPES = ("damage", "open_door", "closed_door", "partially_closed")
 
 
 def build_inspection_json(*, camera: str, report_doc: Dict[str, Any],
@@ -348,18 +393,34 @@ def build_inspection_json(*, camera: str, report_doc: Dict[str, Any],
     else:
         rake_status = "Loaded" if loaded >= empty else "Empty"
 
-    doors_open = doors_closed = 0
+    num_brakevans = sum(1 for w in wagons
+                        if w.get("classification") == C.CLASS_BRAKE_VAN)
+
+    doors_open = doors_closed = doors_partial = 0
     if side:
         state_key = f"{side}_door"
         doors_open = sum(1 for w in wagons if w.get(state_key) == C.DOOR_OPEN)
         doors_closed = sum(1 for w in wagons if w.get(state_key) == C.DOOR_CLOSED)
+        doors_partial = sum(1 for w in wagons if w.get(state_key) == C.DOOR_PARTIAL)
 
     wagon_number_results: Dict[str, Any] = {}
+    loco_number_results: Dict[str, Any] = {}
+    loco_frames: List[Dict[str, Any]] = []
     segment_type_map: Dict[str, Any] = {}
     wagon_segments: List[Dict[str, Any]] = []
     problem_frames: List[Dict[str, Any]] = []
-    pf_type_counts: Dict[str, int] = {}
+    # Every key in this camera's flavour is pre-seeded to 0 so the dashboard
+    # always receives the same shape, whether or not anything was detected.
+    pf_type_counts: Dict[str, int] = {
+        t: 0 for t in (_TOP_PROBLEM_TYPES if is_top else _SIDE_PROBLEM_TYPES)}
     damaged_wagons: set = set()
+    # Top-camera per-class wagon tallies (distinct wagons, not track counts).
+    dmg_class_wagons: Dict[str, set] = {t: set() for t in _TOP_PROBLEM_TYPES}
+    wagons_loaded = wagons_empty = 0
+    # Running counters used by the top-camera segment_type_map, which numbers
+    # each segment WITHIN its own type and tracks a separate wagon ordinal.
+    type_ordinal: Dict[str, int] = {}
+    wagon_ordinal = 0
 
     def _bump(t: str) -> None:
         pf_type_counts[t] = pf_type_counts.get(t, 0) + 1
@@ -367,17 +428,97 @@ def build_inspection_json(*, camera: str, report_doc: Dict[str, Any],
     for w in wagons:
         gw = w.get("global_id", "")
         idx = w.get("wagon_index", 0)
+        classification = w.get("classification")
+        is_non_wagon = classification in (C.CLASS_ENGINE, C.CLASS_BRAKE_VAN)
+
+        # ---- per-camera load verdict (THIS camera's own evidence, not fused) --
+        load_meta = _read_meta(evidence_root, gw, "load", camera) if is_top else {}
+        load_state = load_meta.get("load_status") or w.get("load_status")
+        if is_top and not is_non_wagon:
+            if load_state == C.LOAD_LOADED:
+                wagons_loaded += 1
+            elif load_state == C.LOAD_EMPTY:
+                wagons_empty += 1
+
+        # ---- segment type ----
+        if is_top and not is_non_wagon:
+            # Top cameras distinguish loaded from empty bodies.
+            seg_type = ("wagon_loaded" if load_state == C.LOAD_LOADED else
+                        "wagon_empty" if load_state == C.LOAD_EMPTY else "wagon")
+        else:
+            seg_type = _seg_type(classification)
+
+        if not is_non_wagon:
+            wagon_ordinal += 1
+        type_ordinal[seg_type] = type_ordinal.get(seg_type, 0) + 1
+
+        if is_top:
+            # Top flavour numbers each segment within its own type and carries a
+            # separate running wagon ordinal (null for engines / brake vans).
+            segment_type_map[str(idx)] = {
+                "type": seg_type,
+                "number": type_ordinal[seg_type],
+                "wagon_count": (None if is_non_wagon else wagon_ordinal),
+            }
+        else:
+            segment_type_map[str(idx)] = {"type": seg_type, "number": idx}
+
+        # ---- Loco number (ENGINE segments, RIGHT_UP authority) ----
+        # Read from the engine wagon's OCR evidence, written by the loco branch
+        # of features/ocr.  Keyed by loco_id, matching the dashboard contract.
+        if camera == C.CAMERA_RIGHT_UP and classification == C.CLASS_ENGINE:
+            lm = _read_meta(evidence_root, gw, "ocr", camera)
+            if lm.get("segment_role") == "loco":
+                lid = str(lm.get("loco_id") or (len(loco_number_results) + 1))
+                conf = float(lm.get("ocr_confidence") or 0.0)
+                loco_number_results[lid] = {
+                    "is_valid_5_digit": bool(lm.get("is_valid_5_digit")),
+                    "display_number": lm.get("loco_number") or "-",
+                    "raw_number": lm.get("loco_raw_number") or "",
+                    "confidence": conf,
+                    "ocr_confidence": conf,
+                    # The image Rekognition actually read -- normally the
+                    # three-frame sheet, the single-frame fallback when the
+                    # sheet failed -- so the number can be verified against it.
+                    "ocr_frame_s3_url": _ocr_input_url(
+                        url_maker, evidence_root, gw, camera, lm,
+                        C.OCR_LOCO_SHEET_TEMPLATE.format(
+                            loco_id=int(lm.get("loco_id") or 1))),
+                }
+                for fr in (lm.get("loco_frames") or []):
+                    u = url_maker.url(evidence_root, gw, "ocr", camera,
+                                      fr.get("filename", ""))
+                    if u:
+                        loco_frames.append({
+                            "loco_id": int(lm.get("loco_id") or 1),
+                            "position": fr.get("position"),
+                            "frame_number": fr.get("frame_num"),
+                            "s3_url": u,
+                        })
+
+        # ---- OCR identity (RIGHT_UP only; top cameras have no OCR authority) --
         ident = w.get("wagon_identifier") or C.NO_DATA
         digits = re.sub(r"[^0-9]", "", str(ident)) if ident != C.NO_DATA else ""
         is_valid = len(digits) == C.WAGON_NUMBER_LENGTH
-        wagon_number_results[str(idx)] = {
-            "is_valid_11_digit": bool(is_valid),
-            "display_number": digits if digits else "-",
-        }
-        segment_type_map[str(idx)] = {"type": _seg_type(w.get("classification")),
-                                      "number": idx}
+        if camera == C.CAMERA_RIGHT_UP:
+            ocr_meta = _read_meta(evidence_root, gw, "ocr", camera)
+            wagon_number_results[str(idx)] = {
+                "is_valid_11_digit": bool(is_valid),
+                "display_number": digits if digits else "-",
+                "is_manipulated": bool(ocr_meta.get("is_manipulated", False)),
+                "original_number": str(ocr_meta.get("original_number")
+                                       or (digits if is_valid else "")),
+                # Points at number_sheet.jpg -- the exact three-frame sheet
+                # posted to Rekognition -- so the displayed number can be
+                # verified against the image the engine read.
+                "ocr_frame_s3_url": _ocr_input_url(
+                    evidence_root=evidence_root, url_maker=url_maker, gw=gw,
+                    camera=camera, meta=ocr_meta,
+                    default_name=C.OCR_SHEET_FILENAME),
+            }
 
         # ---- wagon gallery (synthesized from EXISTING evidence only) ----
+        positions = _POSITIONS_TOP if is_top else _POSITIONS_SIDE
         templates = (_TOP_GALLERY if is_top
                      else tuple(t.format(side=side) for t in _SIDE_GALLERY))
         frames: List[Dict[str, Any]] = []
@@ -385,78 +526,107 @@ def build_inspection_json(*, camera: str, report_doc: Dict[str, Any],
             feat, fn = rel.split("/", 1)
             u = url_maker.url(evidence_root, gw, feat, camera, fn)
             if u:
-                frames.append({"position": _POSITIONS[min(len(frames), 3)],
+                frames.append({"position": positions[min(len(frames),
+                                                         len(positions) - 1)],
                                "s3_url": u})
-            if len(frames) >= 4:
+            if len(frames) >= len(positions):
                 break
 
-        door_status = "open" if (side and w.get(f"{side}_door") == C.DOOR_OPEN) \
-            else ("closed" if side else "N/A")
         seg: Dict[str, Any] = {
             "segment_id": idx,
-            "segment_type": _seg_type(w.get("classification")),
-            "wagon_count": idx,
-            "is_valid_wagon_id": bool(is_valid),
-            "door_status": door_status,
+            "segment_type": seg_type,
+            "wagon_count": (wagon_ordinal if is_top else idx),
+            "is_valid_wagon_id": bool(is_valid) if side else False,
             "damage_detected": False,
             "wagon_frames": frames,
         }
-        if is_valid:
-            seg["wagon_number"] = digits
+
+        if is_top:
+            seg.update({
+                "load_status": (str(load_state).lower()
+                                if load_state and load_state != C.NO_DATA else None),
+                # No v4 producer for a load-condition grade -- reported as null
+                # rather than guessed.
+                "load_condition": None,
+                "probable_damage_detected": False,
+                "floor_dmg_detected": False,
+                "inner_wall_dmg_detected": False,
+                "floor_dmg_probable_detected": False,
+            })
+        else:
+            dstate = w.get(f"{side}_door") if side else None
+            seg.update({
+                "door_status": _DOOR_STATUS.get(dstate, "N/A") if side else "N/A",
+                "door_close_detected": dstate == C.DOOR_CLOSED,
+                "door_partial_detected": dstate == C.DOOR_PARTIAL,
+            })
+            if is_valid:
+                seg["wagon_number"] = digits
 
         # ---- problem frames scoped to this camera's authority ----
         if side:
             meta = _read_meta(evidence_root, gw, "door", camera)
             side_meta = (meta.get("sides") or {}).get(side, {})
             dstate = w.get(f"{side}_door")
-            if dstate == C.DOOR_OPEN:
-                _bump("door_open")
+            ptype = _DOOR_PROBLEM_TYPE.get(dstate)
+            if ptype:
+                # Every observed door state is reported, not just anomalies --
+                # the dashboard tallies closed/partial alongside open/damage.
+                _bump(ptype)
+                is_damage = dstate == C.DOOR_DAMAGED
+                if is_damage:
+                    damaged_wagons.add(idx)
+                    seg["damage_detected"] = True
                 problem_frames.append(_problem_frame(
                     idx=idx, gw=gw, camera=camera, evidence_root=evidence_root,
                     url_maker=url_maker, feature="door", img=f"{side}_best.jpg",
-                    problem_type="door_open", class_name="door_open",
+                    problem_type=ptype,
+                    class_name=str(side_meta.get("raw_class") or ptype),
                     bbox=side_meta.get("bbox"), conf=side_meta.get("confidence"),
-                    door_status="open", damage=False))
-            elif dstate == C.DOOR_DAMAGED:
-                _bump("side_damage")
-                damaged_wagons.add(idx)
-                seg["damage_detected"] = True
-                problem_frames.append(_problem_frame(
-                    idx=idx, gw=gw, camera=camera, evidence_root=evidence_root,
-                    url_maker=url_maker, feature="door", img=f"{side}_best.jpg",
-                    problem_type="side_damage", class_name="damage",
-                    bbox=side_meta.get("bbox"), conf=side_meta.get("confidence"),
-                    door_status="N/A", damage=True))
+                    door_status=_DOOR_STATUS.get(dstate, "N/A"), damage=is_damage))
 
         if is_top:
             dmeta = _read_meta(evidence_root, gw, "damage", camera)
             for tr in (dmeta.get("tracks") or []):
                 ti = tr.get("track_idx", 1)
-                cls = tr.get("class_name", "damage")
-                _bump(cls)
+                cls = str(tr.get("class_name") or "damage")
+                dash = _DAMAGE_CLASS_TO_DASH.get(cls, cls)
+                if dash in pf_type_counts:
+                    _bump(dash)
+                if dash in dmg_class_wagons:
+                    dmg_class_wagons[dash].add(idx)
                 damaged_wagons.add(idx)
                 seg["damage_detected"] = True
+                if dash == "floor_dmg":
+                    seg["floor_dmg_detected"] = True
+                elif dash == "inner_wall_dmg":
+                    seg["inner_wall_dmg_detected"] = True
                 problem_frames.append(_problem_frame(
                     idx=idx, gw=gw, camera=camera, evidence_root=evidence_root,
                     url_maker=url_maker, feature="damage", img=f"track_{ti}.jpg",
-                    problem_type=cls, class_name=cls,
+                    problem_type=dash, class_name=cls,
                     bbox=tr.get("bbox"),
                     conf=tr.get("best_confidence", tr.get("confidence")),
                     door_status="N/A", damage=True))
 
-        wagon_segments.append(seg)
+        # Top cameras list only wagon bodies; engines / brake vans appear in
+        # segment_type_map but carry no inspectable body.
+        if not (is_top and is_non_wagon):
+            wagon_segments.append(seg)
 
+    damaged_count = len(damaged_wagons) if (is_top or side) else 0
+
+    degraded = ["direction", "raw_video_urls"]
+    if camera != C.CAMERA_RIGHT_UP:
+        # Loco OCR is RIGHT_UP-authority, like the wagon number.
+        degraded += ["loco_frames", "loco_number_results", "total_loco_frames"]
     if is_top:
-        damaged_count = len(damaged_wagons)
-    elif side:
-        damaged_count = len(damaged_wagons)
-    else:
-        damaged_count = 0
-
-    degraded = ["direction", "loco_frames", "loco_number_results",
-                "total_loco_frames"]
+        # The v4 damage tracker emits confirmed tracks only -- there is no
+        # "probable" tier to report, so those counters are structurally 0.
+        degraded += ["probable_damage_wagons", "floor_dmg_probable_wagons",
+                     "load_condition"]
     if not is_top and not side:
-        degraded.append("doors_open/doors_closed")
+        degraded.append("doors_open/doors_partially_closed/doors_closed")
 
     inspection_data = {
         "raw_video_name": raw_video_name,
@@ -468,20 +638,20 @@ def build_inspection_json(*, camera: str, report_doc: Dict[str, Any],
         "pdf_report_url": _pdf_url(report_meta, camera),
         "trimmed_video_url": src_url,
         "detected_video_url": processed_urls.get(camera, ""),
+        # DEGRADED: v4 consumes one trimmed clip per camera and does not retain
+        # the list of raw clips it was cut from.
         "raw_video_urls": [src_url] if src_url else [],
         "total_wagons": total_wagons,
-        "doors_open": doors_open,
-        "doors_closed": doors_closed,
         "damaged_wagons": damaged_count,
         "num_engines": num_engines,
-        "total_loco_frames": 0,                       # DEGRADED: no loco feed in v4
+        "total_loco_frames": len(loco_frames),
         "total_problem_frames": len(problem_frames),
         "problem_frames_by_type": pf_type_counts,
         "wagon_number_results": wagon_number_results,
-        "loco_number_results": {},                    # DEGRADED
+        "loco_number_results": loco_number_results,
         "segment_type_map": segment_type_map,
         "wagon_segments": wagon_segments,
-        "loco_frames": [],                            # DEGRADED
+        "loco_frames": loco_frames,
         "problem_frames": problem_frames,
         "_adapter": {
             "generated_by": "wagon_eye_v4 delivery.dashboard_ingest",
@@ -493,13 +663,57 @@ def build_inspection_json(*, camera: str, report_doc: Dict[str, Any],
             "camera_authority": ("top:load+damage" if is_top
                                  else (f"side:{side}_door+ocr" if side else "none")),
             "degraded_fields": degraded,
+            "flavour": "top" if is_top else ("side" if side else "none"),
         },
     }
+
+    # Flavour-specific counters.  Side cameras report door tallies; top cameras
+    # report load + per-damage-class tallies.  Keys are inserted next to
+    # `total_wagons` so the document reads in the dashboard's field order.
+    if is_top:
+        _insert_after(inspection_data, "total_wagons", [
+            ("wagons_loaded", wagons_loaded),
+            ("wagons_empty", wagons_empty),
+        ])
+        _insert_after(inspection_data, "damaged_wagons", [
+            ("probable_damage_wagons", 0),            # DEGRADED: no probable tier
+            ("floor_dmg_wagons", len(dmg_class_wagons["floor_dmg"])),
+            ("inner_wall_dmg_wagons", len(dmg_class_wagons["inner_wall_dmg"])),
+            ("floor_dmg_probable_wagons", 0),         # DEGRADED
+        ])
+        _insert_after(inspection_data, "num_engines",
+                      [("num_brakevans", num_brakevans)])
+    else:
+        _insert_after(inspection_data, "total_wagons", [
+            ("doors_open", doors_open),
+            ("doors_partially_closed", doors_partial),
+            ("doors_closed", doors_closed),
+        ])
+
     return {
         "camera_id": full_camera_id(camera),
         "version": _version(),
         "inspection_data": inspection_data,
     }
+
+
+def _insert_after(d: Dict[str, Any], anchor: str,
+                  pairs: List[tuple]) -> None:
+    """Insert `pairs` immediately after `anchor`, preserving dict order.
+
+    Purely cosmetic: the dashboard reads by key, but keeping the emitted field
+    order stable makes the JSON diffable against the reference documents."""
+    if anchor not in d:
+        d.update(dict(pairs))
+        return
+    items = list(d.items())
+    out: List[tuple] = []
+    for k, v in items:
+        out.append((k, v))
+        if k == anchor:
+            out.extend(pairs)
+    d.clear()
+    d.update(out)
 
 
 def _problem_frame(*, idx, gw, camera, evidence_root, url_maker, feature, img,

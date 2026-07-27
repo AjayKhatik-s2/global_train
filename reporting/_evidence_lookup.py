@@ -169,7 +169,7 @@ def evidence_snapshot(
     `slot` examples:
         door:   left_best | left_crop | right_best | right_crop
         damage: track_1 | track_1_crop | ...
-        ocr:    best_frame | number_crop
+        ocr:    number_sheet | best_frame | number_crop
         load:   best_frame
     """
     if not evidence_root:

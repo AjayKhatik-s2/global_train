@@ -244,3 +244,12 @@ JPEG_QUALITY = 90
 
 # OCR
 WAGON_NUMBER_LENGTH = 11
+
+# Evidence filename of the three-frame sheet posted to Rekognition (RIGHT_UP
+# only).  This is the verification artifact: the exact image the engine read,
+# so the number in the dashboard can be checked against its own input.
+OCR_SHEET_FILENAME = "number_sheet.jpg"
+OCR_LOCO_SHEET_TEMPLATE = "loco_{loco_id:03d}_sheet.jpg"
+# Must match the quality `rekognition_reader.read_digits` encodes with, so the
+# persisted sheet is byte-identical to the image the API was posted.
+OCR_SHEET_JPEG_QUALITY = 95

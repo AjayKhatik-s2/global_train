@@ -13,8 +13,8 @@ Pillow>=9.5.0
 torch>=2.0.0
 torchvision>=0.15.0
 
-# OCR
-easyocr>=1.7.0
+# OCR -- AWS Rekognition DetectText via boto3 (see AWS section below).
+# No local OCR engine: wagon numbers are read by the Rekognition service.
 
 # Report generation (fresh reportlab implementation -- no legacy PDF dep)
 reportlab>=4.0.0

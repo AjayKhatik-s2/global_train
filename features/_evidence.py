@@ -11,8 +11,10 @@ Output layout (one per batch):
                 right_crop.jpg
                 metadata.json
             ocr/
-                best_frame.jpg
-                number_crop.jpg
+                number_sheet.jpg       the three-frame sheet posted to
+                                       Rekognition (the verification image)
+                best_frame.jpg         the full frame it was cut from
+                number_crop.jpg        that frame's plate crop
                 metadata.json
             damage/
                 track_1.jpg            damage track snapshot

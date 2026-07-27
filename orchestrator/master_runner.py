@@ -55,7 +55,9 @@ from orchestrator.feature_scheduler import (
     run_features_wagon_wise, FEATURE_CAMERAS, WAGON_FEATURE_ORDER,
 )
 from fusion import wagon_state_builder
-from reporting import combined_train_report, camera_reports
+from reporting import (
+    combined_train_report, camera_reports, camera_inspection_reports,
+)
 from rendering import feature_overlay_renderer
 from delivery import s3_upload, notification
 
@@ -107,6 +109,7 @@ class BatchOutcome:
     report_json_url: Optional[str] = None
     camera_pdf_paths: Dict[str, str] = field(default_factory=dict)
     camera_pdf_urls:  Dict[str, str] = field(default_factory=dict)
+    camera_inspection_paths: Dict[str, str] = field(default_factory=dict)
     processed_video_paths: Dict[str, str] = field(default_factory=dict)
     processed_video_urls:  Dict[str, str] = field(default_factory=dict)
     final_status: str = "unknown"
@@ -288,7 +291,7 @@ def process_batch(
     # the LOAD feature to completion FIRST, then door / ocr / damage in parallel
     # -- so the loaded-wagon floor-damage filter always sees a fully-written
     # wagon_states/load/<gw>.json.  Feature-wise execution + per-model reuse are
-    # preserved (each YOLO/easyocr model still loads once and is reused across
+    # preserved (each YOLO model still loads once and is reused across
     # all wagons within its processor).
     log.info("--- STAGE 3  Feature inference ---")
     _t = time.time()
@@ -417,6 +420,36 @@ def process_batch(
     except Exception as e:
         log.error("[STAGE5a] camera reports FAILED: %s", e, exc_info=True)
         out.camera_pdf_paths = {}
+
+    # ---- Stage 5a-bis: per-camera TRAIN INSPECTION REPORT (additive) ----
+    # Independent of Stage 5a/5b: a failure here omits only these PDFs.
+    log.info("--- STAGE 5a-bis  Camera inspection reports ---")
+    try:
+        out.camera_inspection_paths = {
+            cam: p for cam, p in camera_inspection_reports.build_all(
+                state=recon.state,
+                unified=out.unified,
+                output_dir=reports_root,
+                batch_key=batch.batch_key,
+                cache_root=cache_root,
+                wagon_states_root=states_root,
+                evidence_root=evidence_root,
+                per_camera_tracking_path=_per_camera_tracking_path,
+                video_paths=video_paths,
+                source_video_urls={
+                    cam: batch.videos[cam].s3_url
+                    for cam in C.ALL_CAMERAS
+                    if cam in batch.videos
+                    and batch.videos[cam].bucket != "__local__"
+                },
+                logo_path=_logo_path,
+                verbose=verbose,
+            ).items() if p
+        }
+    except Exception as e:
+        log.error("[STAGE5a-bis] camera inspection reports FAILED: %s",
+                  e, exc_info=True)
+        out.camera_inspection_paths = {}
 
     # Relative basenames are linkable both locally (sibling file:// in the
     # reports/ dir) and on S3 (sibling object under reports/<batch>/).
@@ -837,6 +870,8 @@ def run_local(
         log.info("[LOCAL] JSON: %s", outcome.report_json_path)
     for cam, path in outcome.camera_pdf_paths.items():
         log.info("[LOCAL] %-13s PDF: %s", cam, path)
+    for cam, path in outcome.camera_inspection_paths.items():
+        log.info("[LOCAL] %-13s INSPECTION PDF: %s", cam, path)
     for cam, path in outcome.processed_video_paths.items():
         log.info("[LOCAL] VIDEO  %s: %s", cam, path)
     return 0 if outcome.final_status in (C.BATCH_COMPLETED,

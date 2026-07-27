@@ -391,7 +391,9 @@ def stage_reports(manifest: BatchManifest, ctx: RunContext, *, final: bool,
     """Regenerate overlays + camera PDFs for `cameras` (a late camera regenerates
     only its own artifacts) and always regenerate the aggregating combined
     report/JSON.  Never loads a model."""
-    from reporting import combined_train_report, camera_reports
+    from reporting import (
+        combined_train_report, camera_reports, camera_inspection_reports,
+    )
     from rendering import feature_overlay_renderer
     from fusion import wagon_state_builder
 
@@ -448,6 +450,28 @@ def stage_reports(manifest: BatchManifest, ctx: RunContext, *, final: bool,
     except Exception as e:
         log.error("[REPORT %s] camera reports failed: %s", manifest.batch_key, e)
 
+    # 5a-bis: per-camera TRAIN INSPECTION REPORT (additive, independent).
+    # Failure here never affects the camera reports above or the combined
+    # report below -- it only omits its own PDFs.
+    camera_inspection_paths: Dict[str, str] = {}
+    try:
+        camera_inspection_paths = {
+            cam: p for cam, p in camera_inspection_reports.build_all(
+                state=state, unified=unified, output_dir=reports_root,
+                batch_key=manifest.batch_key, cache_root=cache_root,
+                wagon_states_root=states_root, evidence_root=evidence_root,
+                per_camera_tracking_path=pcf_path, video_paths=video_paths,
+                source_video_urls={c: manifest.cameras[c].s3_url
+                                   for c in manifest.present_cameras()
+                                   if manifest.cameras[c].bucket != "__local__"},
+                logo_path=CFG.LOGO_PATH, cameras=render_cams,
+                verbose=ctx.verbose,
+            ).items() if p
+        }
+    except Exception as e:
+        log.error("[REPORT %s] camera inspection reports failed: %s",
+                  manifest.batch_key, e)
+
     # All camera PDFs that exist on disk (sibling links in the combined report).
     from reporting.camera_reports import CAMERA_FILE
     camera_pdf_paths = {cam: os.path.join(reports_root, CAMERA_FILE[cam])
@@ -475,6 +499,7 @@ def stage_reports(manifest: BatchManifest, ctx: RunContext, *, final: bool,
     )
     _persist(manifest, ctx)
     return {"unified": unified, "camera_pdf_paths": camera_pdf_paths,
+            "camera_inspection_paths": camera_inspection_paths,
             "report_meta": meta, **(result or {})}
 
 

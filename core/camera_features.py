@@ -44,7 +44,13 @@ FEATURE_MODEL_FILENAME: Dict[str, str] = {
 # shape or write layout changes so stale results are re-run rather than reused.
 FEATURE_SCHEMA_VERSION: Dict[str, int] = {
     FEATURE_DOOR:   1,
-    FEATURE_OCR:    1,
+    # v2: per-wagon JSON + evidence metadata carry `is_manipulated` and
+    #     `original_number` (wagon-type correction provenance).
+    # v3: OCR engine switched from local easyocr (every frame + cross-frame digit
+    #     voting) to AWS Rekognition DetectText on band-selected frames.  Results
+    #     and confidences come from a different engine entirely, so v1/v2 results
+    #     must re-run rather than be reused.
+    FEATURE_OCR:    3,
     FEATURE_LOAD:   1,
     FEATURE_DAMAGE: 1,
 }

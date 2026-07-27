@@ -197,17 +197,24 @@ def test_right_up_authority_doors_and_ocr(tmp_path):
                                  url_maker=_url_maker(root, "RIGHT_UP"))["inspection_data"]
     assert d["total_wagons"] == 2               # global authoritative count
     assert d["doors_open"] == 1                 # GW_1 right OPEN
-    assert d["wagon_number_results"]["1"] == {"is_valid_11_digit": True,
-                                              "display_number": "12345678901"}
+    # side flavour carries the full door tally, including PARTIAL
+    assert {"doors_open", "doors_partially_closed", "doors_closed"} <= set(d)
+    wn = d["wagon_number_results"]["1"]
+    assert wn["is_valid_11_digit"] is True
+    assert wn["display_number"] == "12345678901"
+    # OCR provenance is now carried through instead of dropped
+    assert wn["is_manipulated"] is False
+    assert wn["original_number"] == "12345678901"
+    assert "ocr" in (wn["ocr_frame_s3_url"] or "")
     assert d["wagon_number_results"]["2"]["is_valid_11_digit"] is False
-    # one door_open problem frame with bbox+class from door metadata
-    pf = [p for p in d["problem_frames"] if p["problem_type"] == "door_open"]
+    # one open_door problem frame with bbox from door metadata
+    pf = [p for p in d["problem_frames"] if p["problem_type"] == "open_door"]
     assert len(pf) == 1
-    assert pf[0]["bounding_box"]["class_name"] == "door_open"
     assert pf[0]["bounding_box"]["bounding_box_coordinates"] == [10, 20, 110, 220]
     assert pf[0]["s3_url"] and "evidence/GW_1/door/RIGHT_UP/right_best.jpg" in pf[0]["s3_url"]
     assert d["rake_status"] == "Loaded"         # fused load: loaded>=empty
     assert d["_adapter"]["camera_authority"] == "side:right_door+ocr"
+    assert d["_adapter"]["flavour"] == "side"
 
 
 def test_left_up_authority_isolated(tmp_path):
@@ -218,7 +225,16 @@ def test_left_up_authority_isolated(tmp_path):
                                  evidence_root=ev,
                                  url_maker=_url_maker(root, "LEFT_UP"))["inspection_data"]
     assert d["doors_open"] == 0                 # both left doors CLOSED
-    assert d["problem_frames"] == []
+    assert d["doors_closed"] == 2
+    # Every observed door state is reported, not just anomalies -- two CLOSED
+    # doors therefore yield two closed_door problem frames and no open/damage.
+    assert d["problem_frames_by_type"]["closed_door"] == 2
+    assert d["problem_frames_by_type"]["open_door"] == 0
+    assert d["problem_frames_by_type"]["damage"] == 0
+    assert all(p["problem_type"] == "closed_door" for p in d["problem_frames"])
+    assert d["damaged_wagons"] == 0
+    # LEFT_UP has no OCR authority -> no wagon numbers at all
+    assert d["wagon_number_results"] == {}
     assert d["_adapter"]["camera_authority"] == "side:left_door+ocr"
 
 
@@ -229,12 +245,214 @@ def test_top_authority_load_and_damage(tmp_path):
     d = DI.build_inspection_json(camera="RIGHT_UP_TOP", report_doc=report,
                                  evidence_root=ev,
                                  url_maker=_url_maker(root, "RIGHT_UP_TOP"))["inspection_data"]
-    assert d["doors_open"] == 0 and d["doors_closed"] == 0
+    # top flavour reports load/damage tallies, NOT door tallies
+    assert "doors_open" not in d and "doors_closed" not in d
+    assert {"wagons_loaded", "wagons_empty", "num_brakevans",
+            "probable_damage_wagons", "floor_dmg_wagons",
+            "inner_wall_dmg_wagons", "floor_dmg_probable_wagons"} <= set(d)
     assert d["damaged_wagons"] == 1
+    assert d["floor_dmg_wagons"] == 1
+    assert d["inner_wall_dmg_wagons"] == 0
+    # v4 has no "probable" damage tier -- structurally zero, never guessed
+    assert d["probable_damage_wagons"] == 0
+    assert d["floor_dmg_probable_wagons"] == 0
+    assert set(d["problem_frames_by_type"]) == {
+        "floor_dmg", "inner_wall_dmg", "floor_dmg_probable"}
+    assert d["problem_frames_by_type"]["floor_dmg"] == 1
     pf = [p for p in d["problem_frames"] if p["damage_detected"]]
-    assert len(pf) == 1 and pf[0]["bounding_box"]["class_name"] == "floor_damage"
+    # problem_type uses the dashboard vocabulary; the raw model class is kept
+    # on the bounding box
+    assert len(pf) == 1 and pf[0]["problem_type"] == "floor_dmg"
+    assert pf[0]["bounding_box"]["class_name"] == "floor_damage"
     assert pf[0]["bounding_box"]["bounding_box_coordinates"] == [5, 6, 55, 66]
+    # top segments carry load fields and no door fields
+    seg = d["wagon_segments"][0]
+    assert "load_status" in seg and "door_status" not in seg
+    assert seg["floor_dmg_detected"] in (True, False)
+    assert len(seg["wagon_frames"]) <= 3          # top gallery is 3-position
+    # segment_type_map carries a per-type ordinal plus a wagon ordinal
+    any_entry = next(iter(d["segment_type_map"].values()))
+    assert {"type", "number", "wagon_count"} == set(any_entry)
     assert d["_adapter"]["camera_authority"] == "top:load+damage"
+    assert d["_adapter"]["flavour"] == "top"
+
+
+# -----------------------------------------------------------------------------
+# schema contract -- key sets transcribed from the dashboard reference documents
+# -----------------------------------------------------------------------------
+
+_SIDE_KEYS = {
+    "raw_video_name", "identified_by", "upload_timestamp",
+    "upload_timestamp_readable", "direction", "rake_status", "pdf_report_url",
+    "trimmed_video_url", "detected_video_url", "raw_video_urls", "total_wagons",
+    "doors_open", "doors_partially_closed", "doors_closed", "damaged_wagons",
+    "num_engines", "total_loco_frames", "total_problem_frames",
+    "problem_frames_by_type", "wagon_number_results", "loco_number_results",
+    "segment_type_map", "wagon_segments",
+}
+_TOP_KEYS = {
+    "raw_video_name", "identified_by", "upload_timestamp",
+    "upload_timestamp_readable", "direction", "rake_status", "pdf_report_url",
+    "trimmed_video_url", "detected_video_url", "raw_video_urls", "total_wagons",
+    "wagons_loaded", "wagons_empty", "damaged_wagons", "probable_damage_wagons",
+    "floor_dmg_wagons", "inner_wall_dmg_wagons", "floor_dmg_probable_wagons",
+    "num_engines", "num_brakevans", "total_loco_frames", "total_problem_frames",
+    "problem_frames_by_type", "wagon_number_results", "loco_number_results",
+    "segment_type_map", "wagon_segments",
+}
+# Emitted in addition to the reference contract (v4 provenance / raw feeds).
+_EXTRA = {"loco_frames", "problem_frames", "_adapter"}
+
+
+def _doc(root, camera):
+    report = make_batch(root)
+    return DI.build_inspection_json(
+        camera=camera, report_doc=report,
+        evidence_root=os.path.join(root, "evidence"),
+        url_maker=_url_maker(root, camera))["inspection_data"]
+
+
+def test_side_camera_schema_contract(tmp_path):
+    d = _doc(str(tmp_path), "RIGHT_UP")
+    assert _SIDE_KEYS <= set(d)
+    assert set(d) - _SIDE_KEYS <= _EXTRA
+    seg = d["wagon_segments"][0]
+    assert {"segment_id", "segment_type", "wagon_count", "door_status",
+            "door_close_detected", "door_partial_detected", "damage_detected",
+            "wagon_frames", "is_valid_wagon_id"} <= set(seg)
+    assert set(seg) - {"wagon_number"} <= {
+        "segment_id", "segment_type", "wagon_count", "door_status",
+        "door_close_detected", "door_partial_detected", "damage_detected",
+        "wagon_frames", "is_valid_wagon_id"}
+    assert len(seg["wagon_frames"]) <= 4          # side gallery is 4-position
+    assert set(d["wagon_number_results"]["1"]) == {
+        "is_valid_11_digit", "display_number", "is_manipulated",
+        "original_number", "ocr_frame_s3_url"}
+
+
+def test_top_camera_schema_contract(tmp_path):
+    d = _doc(str(tmp_path), "RIGHT_UP_TOP")
+    assert _TOP_KEYS <= set(d)
+    assert set(d) - _TOP_KEYS <= _EXTRA
+    assert set(d["wagon_segments"][0]) == {
+        "segment_id", "segment_type", "wagon_count", "load_status",
+        "load_condition", "damage_detected", "probable_damage_detected",
+        "floor_dmg_detected", "inner_wall_dmg_detected",
+        "floor_dmg_probable_detected", "wagon_frames", "is_valid_wagon_id"}
+    # engines/brake vans appear in the type map but carry no inspectable body
+    assert any(v["type"] == "engine" for v in d["segment_type_map"].values())
+    assert all(s["segment_type"] != "engine" for s in d["wagon_segments"])
+    assert all(v["wagon_count"] is None
+               for v in d["segment_type_map"].values() if v["type"] == "engine")
+
+
+def test_top_segment_type_reflects_own_camera_load(tmp_path):
+    """wagon_loaded / wagon_empty comes from THIS camera's load evidence."""
+    d = _doc(str(tmp_path), "RIGHT_UP_TOP")
+    types = {s["segment_id"]: s["segment_type"] for s in d["wagon_segments"]}
+    assert set(types.values()) <= {"wagon_loaded", "wagon_empty", "wagon"}
+    assert d["wagons_loaded"] + d["wagons_empty"] <= d["total_wagons"]
+
+
+def test_wagon_ocr_url_points_at_the_rekognition_sheet(tmp_path):
+    """`ocr_frame_s3_url` must resolve to the image Rekognition actually read,
+    so the displayed number can be verified against its own OCR input."""
+    root = str(tmp_path)
+    report = make_batch(root)
+    ev = os.path.join(root, "evidence")
+    ocr_dir = os.path.join(ev, "GW_1", "ocr", "RIGHT_UP")
+    _write(os.path.join(ocr_dir, "metadata.json"), {
+        "full_number": "12345678901", "ocr_confidence": 0.9,
+        "ocr_input_image": C.OCR_SHEET_FILENAME,
+        "sheet_frames": [12, 14, 16],
+    })
+    _touch_jpg(os.path.join(ocr_dir, C.OCR_SHEET_FILENAME))
+
+    d = DI.build_inspection_json(camera="RIGHT_UP", report_doc=report,
+                                 evidence_root=ev,
+                                 url_maker=_url_maker(root, "RIGHT_UP"))["inspection_data"]
+    url = d["wagon_number_results"]["1"]["ocr_frame_s3_url"]
+    assert url and url.endswith(f"/GW_1/ocr/RIGHT_UP/{C.OCR_SHEET_FILENAME}")
+
+
+def test_wagon_ocr_url_falls_back_when_no_sheet_recorded(tmp_path):
+    """Evidence written before the sheet existed still yields a thumbnail."""
+    d = _doc(str(tmp_path), "RIGHT_UP")          # fixture writes best_frame.jpg only
+    url = d["wagon_number_results"]["1"]["ocr_frame_s3_url"]
+    assert url and url.endswith("/GW_1/ocr/RIGHT_UP/best_frame.jpg")
+
+
+def test_loco_ocr_url_follows_the_winning_candidate(tmp_path):
+    """When the sheet failed and the single-frame fallback produced the number,
+    the URL must be that frame -- not the sheet."""
+    root = str(tmp_path)
+    report = make_batch(root)
+    ev = os.path.join(root, "evidence")
+    loco_dir = os.path.join(ev, "GW_2", "ocr", "RIGHT_UP")
+    _write(os.path.join(loco_dir, "metadata.json"), {
+        "segment_role": "loco", "loco_id": 1,
+        "loco_number": "44014", "loco_raw_number": "44014",
+        "is_valid_5_digit": True, "ocr_confidence": 0.9,
+        "ocr_input_image": "loco_001_frame_000123.jpg",
+        "ocr_input_role": "best", "loco_frames": [],
+    })
+    _touch_jpg(os.path.join(loco_dir, "loco_001_sheet.jpg"))
+    _touch_jpg(os.path.join(loco_dir, "loco_001_frame_000123.jpg"))
+
+    d = DI.build_inspection_json(camera="RIGHT_UP", report_doc=report,
+                                 evidence_root=ev,
+                                 url_maker=_url_maker(root, "RIGHT_UP"))["inspection_data"]
+    assert "loco_001_frame_000123.jpg" in (
+        d["loco_number_results"]["1"]["ocr_frame_s3_url"] or "")
+
+
+def test_loco_number_results_populated_from_engine_evidence(tmp_path):
+    """GW_2 is an ENGINE: its loco OCR evidence must surface as
+    loco_number_results / loco_frames / total_loco_frames."""
+    root = str(tmp_path)
+    report = make_batch(root)
+    ev = os.path.join(root, "evidence")
+    loco_dir = os.path.join(ev, "GW_2", "ocr", "RIGHT_UP")
+    _write(os.path.join(loco_dir, "metadata.json"), {
+        "segment_role": "loco", "loco_id": 1,
+        "loco_number": "44014", "loco_raw_number": "44014",
+        "is_valid_5_digit": True, "ocr_confidence": 0.984,
+        "loco_frames": [{"position": p, "frame_num": 100 + i,
+                         "filename": f"loco_001_{p}.jpg"}
+                        for i, p in enumerate(("start", "mid1", "mid2", "end"))],
+    })
+    _touch_jpg(os.path.join(loco_dir, "loco_001_sheet.jpg"))
+    for p in ("start", "mid1", "mid2", "end"):
+        _touch_jpg(os.path.join(loco_dir, f"loco_001_{p}.jpg"))
+
+    d = DI.build_inspection_json(camera="RIGHT_UP", report_doc=report,
+                                 evidence_root=ev,
+                                 url_maker=_url_maker(root, "RIGHT_UP"))["inspection_data"]
+    assert set(d["loco_number_results"]) == {"1"}
+    loco = d["loco_number_results"]["1"]
+    assert loco["is_valid_5_digit"] is True
+    assert loco["display_number"] == "44014"
+    assert abs(loco["confidence"] - 0.984) < 1e-6
+    assert "loco_001_sheet.jpg" in (loco["ocr_frame_s3_url"] or "")
+    assert d["total_loco_frames"] == 4
+    assert {f["position"] for f in d["loco_frames"]} == {
+        "start", "mid1", "mid2", "end"}
+    # no longer degraded on the master camera
+    for k in ("loco_number_results", "loco_frames", "total_loco_frames"):
+        assert k not in d["_adapter"]["degraded_fields"]
+
+
+def test_loco_results_are_right_up_authority_only(tmp_path):
+    """A top/side non-master camera never reports loco numbers."""
+    root = str(tmp_path)
+    report = make_batch(root)
+    ev = os.path.join(root, "evidence")
+    d = DI.build_inspection_json(camera="LEFT_UP", report_doc=report,
+                                 evidence_root=ev,
+                                 url_maker=_url_maker(root, "LEFT_UP"))["inspection_data"]
+    assert d["loco_number_results"] == {}
+    assert d["total_loco_frames"] == 0
+    assert "loco_number_results" in d["_adapter"]["degraded_fields"]
 
 
 def test_degraded_fields_not_invented(tmp_path):
@@ -267,10 +485,13 @@ def test_missing_evidence_graceful(tmp_path):
     assert d["doors_open"] == 1
     for seg in d["wagon_segments"]:
         assert seg["wagon_frames"] == []       # no invented urls
-    # door_open PF still emitted but with zeroed bbox (metadata absent)
-    pf = [p for p in d["problem_frames"] if p["problem_type"] == "door_open"]
+    # open_door PF still emitted but with zeroed bbox (metadata absent)
+    pf = [p for p in d["problem_frames"] if p["problem_type"] == "open_door"]
     assert pf and pf[0]["bounding_box"]["bounding_box_coordinates"] == [0, 0, 0, 0]
     assert pf[0]["s3_url"] is None
+    # OCR provenance degrades to safe defaults, never fabricated
+    wn = d["wagon_number_results"]["1"]
+    assert wn["is_manipulated"] is False and wn["ocr_frame_s3_url"] is None
 
 
 # -----------------------------------------------------------------------------

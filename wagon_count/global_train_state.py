@@ -224,6 +224,11 @@ class GlobalWagon:
     end_time: float
     classification: str = SegmentClass.UNKNOWN
     classification_confidence: float = 0.0
+    # Per-camera semantic votes that produced `classification` (RIGHT_UP via
+    # side_classification.pt + the two TOP cameras via top_classification.pt).
+    # Audit only -- downstream keys off `classification`, which is unchanged in
+    # shape.  Empty when no top evidence was available.
+    classification_sources: Dict[str, Any] = field(default_factory=dict)
     supporting_cameras: List[str] = field(default_factory=list)
     # Provenance: was this wagon created by inserting a recovered gap?
     split_from_global_id: Optional[str] = None
@@ -246,6 +251,7 @@ class GlobalWagon:
             "duration": round(self.duration, 4),
             "classification": self.classification,
             "classification_confidence": round(self.classification_confidence, 4),
+            "classification_sources": dict(self.classification_sources),
             "supporting_cameras": list(self.supporting_cameras),
             "split_from_global_id": self.split_from_global_id,
             "leading_gap": self.leading_gap,

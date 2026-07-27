@@ -573,6 +573,82 @@ def refine_master_boundaries(
 
 
 # -----------------------------------------------------------------------------
+# Step F3 -- semantic-label fusion (top_classification.pt evidence)
+# -----------------------------------------------------------------------------
+
+def _top_label_for_window(cls_list: List[_MasterClassification],
+                          sf: int, ef: int) -> Tuple[Optional[str], float]:
+    """Max-overlap top-camera class label over a wagon's master-frame window."""
+    best, best_ov = None, 0
+    for c in cls_list:
+        ov = min(ef, c.end_frame) - max(sf, c.start_frame)
+        if ov > best_ov:
+            best_ov, best = ov, c
+    if best is None or best_ov <= 0:
+        return None, 0.0
+    return best.label, float(best.confidence)
+
+
+def fuse_semantic_labels(
+    wagons: List[GlobalWagon],
+    top_classifications: Dict[str, List[_MasterClassification]],
+    weights: Dict[str, float],
+    *,
+    verbose: bool = True,
+) -> None:
+    """Refine each ``GlobalWagon.classification`` with the TOP cameras' semantic
+    evidence (top_classification.pt) IN PLACE.
+
+    RIGHT_UP (side_classification.pt) is the weight-1.0 anchor; each top camera
+    adds a trust-weighted vote for the class it read over the same master-frame
+    window.  The wagon COUNT, IDs, and boundaries are never touched -- only the
+    class label + its confidence.  Physical structure is then enforced: ENGINE
+    only in a LEADING contiguous run and BRAKE_VAN only in a TRAILING contiguous
+    run, so a stray engine/brake-van read can never contaminate the wagon region
+    (requirement: "prevent wagon creation inside engine or brake van regions").
+    """
+    tops = {c: cl for c, cl in (top_classifications or {}).items() if cl}
+    if not wagons:
+        return
+    for w in wagons:
+        votes: Dict[str, float] = {}
+        src: Dict[str, Any] = {}
+        base_conf = max(float(w.classification_confidence or 0.0), 0.5)
+        votes[w.classification] = (votes.get(w.classification, 0.0)
+                                   + float(weights.get(MASTER_CAMERA, 1.0)) * base_conf)
+        src[MASTER_CAMERA] = {"label": w.classification,
+                              "confidence": round(float(w.classification_confidence or 0.0), 3)}
+        for cam, cls_list in tops.items():
+            w_c = float(weights.get(cam, 0.0))
+            if w_c <= 0.0:
+                continue
+            lbl, conf = _top_label_for_window(cls_list, w.start_frame_master, w.end_frame_master)
+            if not lbl:
+                continue
+            votes[lbl] = votes.get(lbl, 0.0) + w_c * conf
+            src[cam] = {"label": lbl, "confidence": round(conf, 3)}
+        final = max(sorted(votes), key=lambda k: votes[k])   # deterministic argmax
+        tot = sum(votes.values())
+        w.classification = final
+        w.classification_confidence = float(votes[final] / tot) if tot > 0 else 0.0
+        w.classification_sources = src
+
+    n = len(wagons)
+    i = 0
+    while i < n and wagons[i].classification == SegmentClass.ENGINE:
+        i += 1
+    for w in wagons[i:]:
+        if w.classification == SegmentClass.ENGINE:      # engine can't be mid-train
+            w.classification = SegmentClass.WAGON
+    j = n - 1
+    while j >= 0 and wagons[j].classification == SegmentClass.BRAKE_VAN:
+        j -= 1
+    for w in wagons[:j + 1]:
+        if w.classification == SegmentClass.BRAKE_VAN:   # brake van can't be mid-train
+            w.classification = SegmentClass.WAGON
+
+
+# -----------------------------------------------------------------------------
 # Step G -- end-to-end
 # -----------------------------------------------------------------------------
 
@@ -581,6 +657,7 @@ def assemble_global_train_state(
     master_tracks: LocalCameraTracks,
     support_tracks: List[LocalCameraTracks],
     initial_classifications: List[_MasterClassification],
+    top_classifications: Optional[Dict[str, List[_MasterClassification]]] = None,
     config: Optional[Dict[str, Any]] = None,
     verbose: bool = True,
 ) -> GlobalTrainState:
@@ -652,6 +729,17 @@ def assemble_global_train_state(
 
     total = len(wagons)
 
+    # --- Semantic refinement: fold top_classification.pt evidence into each
+    # wagon's class label (ENGINE/WAGON/BRAKE_VAN) WITHOUT changing count/ids/
+    # boundaries.  RIGHT_UP stays the weight-1.0 anchor; the top cameras add
+    # trust-weighted votes and pin the engine/brake-van regions to the ends.
+    if top_classifications:
+        try:
+            fuse_semantic_labels(wagons, top_classifications, weights, verbose=verbose)
+        except Exception as e:
+            if verbose:
+                print(f"[STAGE1] semantic fusion skipped: {type(e).__name__}: {e}")
+
     # LEFT_UP (and any weight-0 camera): train envelope only -> stored as a note
     notes: List[str] = []
     for pt in projection_tracks:
@@ -696,6 +784,20 @@ def assemble_global_train_state(
         if verbose:
             extra = f"  (+{len(leftover)} unmatched evidence)" if leftover else ""
             print(f"[STAGE1] {rt.camera_id} matched: {matched_wagons}/{total}{extra}")
+
+    if verbose and top_classifications:
+        eng = [w.global_id for w in wagons if w.classification == SegmentClass.ENGINE]
+        bv = [w.global_id for w in wagons if w.classification == SegmentClass.BRAKE_VAN]
+        n_wag = sum(1 for w in wagons if w.classification == SegmentClass.WAGON)
+        print(f"[STAGE1] Semantic evidence: top_classification.pt on "
+              f"{sorted(top_classifications)}")
+        print(f"[STAGE1] Engine region: {eng or '(none)'} | "
+              f"Brake-van region: {bv or '(none)'} | WAGON wagons: {n_wag}")
+        if wagons:
+            print(f"[STAGE1] Train start: {wagons[0].global_id} "
+                  f"({wagons[0].classification}) @f{wagons[0].start_frame_master} | "
+                  f"Train end: {wagons[-1].global_id} ({wagons[-1].classification}) "
+                  f"@f{wagons[-1].end_frame_master}")
 
     if verbose:
         print(f"[STAGE1] Global boundaries finalized -- Final Global Train: "

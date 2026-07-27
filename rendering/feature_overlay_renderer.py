@@ -293,6 +293,31 @@ def _draw_damage_info(frame, frame_idx: int, n_damages: int, frame_class: str) -
         cv2.putText(frame, line, (10, y), _FONT, 0.7, (0, 255, 0), 2)
 
 
+# Semantic train-region label colours (BGR) -- distinct from door/damage/gap.
+_CLASS_COLORS: Dict[str, Tuple[int, int, int]] = {
+    "ENGINE":    (0, 165, 255),   # orange
+    "WAGON":     (0, 255, 0),     # green
+    "BRAKE_VAN": (255, 128, 0),   # blue-ish
+    "UNKNOWN":   (200, 200, 200), # grey
+}
+
+
+def _draw_class_label(frame, classification: str, *, y: int = 0) -> None:
+    """Synchronized train-region class label, top-left, on ALL four cameras.
+
+    ``classification`` is the canonical GlobalWagon class (same value in every
+    camera), rendered as e.g. ``Class: BRAKE VAN`` so the four processed videos
+    stay in lockstep even if one camera briefly misreads a frame."""
+    cls = (classification or "UNKNOWN").upper()
+    text = f"Class: {cls.replace('_', ' ')}"
+    color = _CLASS_COLORS.get(cls, _CLASS_COLORS["UNKNOWN"])
+    (tw, th), _ = cv2.getTextSize(text, _FONT, 0.8, 2)
+    ov = frame.copy()
+    cv2.rectangle(ov, (6, y + 6), (6 + tw + 16, y + th + 20), (0, 0, 0), -1)
+    cv2.addWeighted(ov, 0.55, frame, 0.45, 0, frame)
+    cv2.putText(frame, text, (14, y + th + 14), _FONT, 0.8, color, 2, cv2.LINE_AA)
+
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
@@ -366,14 +391,15 @@ def _render_one_camera(
     is_side = camera_id in C.SIDE_CAMERAS
     is_top  = camera_id in C.TOP_CAMERAS
 
-    # The legacy top-camera info block prints the wagon TYPE; map frame -> wagon
-    # class for that line only (side cameras don't draw it).
+    # frame -> GlobalWagon, for BOTH the legacy top-camera info line AND the
+    # synchronized "Class:" label now drawn on all four cameras.  Built for every
+    # camera so the semantic Engine/Wagon/Brake-Van label (from the canonical
+    # Global Train) appears identically in RIGHT_UP, LEFT_UP and the two tops.
     frame_to_wagon: Dict[int, GlobalWagon] = {}
-    if is_top:
-        for w in state.wagons:
-            sf, ef = _map_wagon_to_local_frames(w, src_fps, total)
-            for f in range(sf, ef + 1):
-                frame_to_wagon[f] = w
+    for w in state.wagons:
+        sf, ef = _map_wagon_to_local_frames(w, src_fps, total)
+        for f in range(sf, ef + 1):
+            frame_to_wagon[f] = w
 
     # Stage-1 gap overlay (all four cameras).  Boundary lines come from the FUSED
     # wagon time windows mapped to this camera's local frames (same arithmetic as
@@ -385,7 +411,8 @@ def _render_one_camera(
         for w in state.wagons
         if _map_wagon_to_local_frames(w, src_fps, total)[0] > 0
     })
-    gap_by_frame = gap_overlay.build_gap_frame_index(camera_meta.get("gaps") or [])
+    gaps_numbered = gap_overlay.number_gaps(camera_meta.get("gaps") or [])
+    gap_by_frame = gap_overlay.build_gap_frame_index(gaps_numbered)
 
     overlay = _OverlayRegistry(
         camera_id=camera_id, evidence_root=evidence_root, wagons=state.wagons,
@@ -412,17 +439,22 @@ def _render_one_camera(
                 _draw_damage_det(frame, item)
                 n_damages += 1
 
+        cur_wagon = frame_to_wagon.get(frame_idx)
+        cur_class = str(cur_wagon.classification).upper() if cur_wagon else "WAGON"
         if is_side:
             evs = overlay.events_by_frame.get(frame_idx)
             if evs:
                 _draw_event_banner(frame, evs)
+            # synchronized train-region class label, top-left
+            _draw_class_label(frame, cur_class, y=0)
         elif is_top:
-            w = frame_to_wagon.get(frame_idx)
-            frame_class = str(w.classification).upper() if w else "WAGON"
-            _draw_damage_info(frame, frame_idx, n_damages, frame_class)
+            _draw_damage_info(frame, frame_idx, n_damages, cur_class)
+            # class label just below the legacy top-left info block
+            _draw_class_label(frame, cur_class, y=86)
 
         # Stage-1 gaps LAST so they overlay (never replace) the feature boxes.
-        gap_overlay.draw_gap_overlays(frame, frame_idx, gap_by_frame, gap_boundary_frames)
+        gap_overlay.draw_gap_overlays(frame, frame_idx, gap_by_frame, gap_boundary_frames,
+                                      all_gaps=gaps_numbered, show_counter=True)
 
         writer.write(frame)
         written += 1

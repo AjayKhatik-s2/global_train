@@ -294,11 +294,18 @@ class GapTracker:
         next_track_id = 1
         raw_detections: Dict[int, List[Dict[str, Any]]] = {}
 
-        # Reset diagnostic counters for this video
-        self._diag_total_yolo_boxes = 0
-        self._diag_after_class = 0
-        self._diag_after_conf = 0
-        self._diag_kept = 0
+        # Reset diagnostic counters for this video -- these drive the Stage-1
+        # gap-lifecycle audit (raw -> filtered -> deduped -> tracked -> merged
+        # -> final).  Exposed via self.stats after process_video().
+        self._diag_total_yolo_boxes = 0   # every raw YOLO box
+        self._diag_after_class = 0        # survived class filter
+        self._diag_after_conf = 0         # survived confidence floor
+        self._diag_kept = 0               # survived height filter (candidates)
+        self._diag_after_nms = 0          # candidates surviving same-frame NMS
+        self._diag_tracks_created = 0     # _Track objects ever created
+        self._diag_tracks_confirmed = 0   # tracks that reached min_hits
+        self._diag_tracks_merged = 0      # duplicate tracks folded away
+        self.stats: Dict[str, int] = {}
 
         frame_idx = 0
         t0 = time.time()
@@ -373,6 +380,7 @@ class GapTracker:
                     tr.update(frame_idx, cx, det["confidence"], det["bbox"])
                     active_tracks.append(tr)
                     next_track_id += 1
+                    self._diag_tracks_created += 1
 
             # Increment miss for tracks not matched this frame
             for i, tr in enumerate(active_tracks):
@@ -416,6 +424,18 @@ class GapTracker:
             if tr.confirmed:
                 completed_tracks.append(tr)
 
+        self._diag_tracks_confirmed = len(completed_tracks)
+
+        # DUPLICATE REMOVAL -- fold together tracks that represent the SAME
+        # physical gap (two ids alive over the same frames at the same x).
+        # Distinct gaps are separated either in TIME (sequential as the train
+        # passes) or in SPACE (two boundaries in view sit at different x), so
+        # this can never merge two real gaps -- it only heals duplicates the
+        # per-frame NMS did not already prevent.
+        before = len(completed_tracks)
+        completed_tracks = self._merge_duplicate_tracks(completed_tracks)
+        self._diag_tracks_merged = before - len(completed_tracks)
+
         # Sort by first_frame so GapEvents are temporally ordered, then
         # rewrite track_ids 1..N for determinism
         completed_tracks.sort(key=lambda t: (t.first_frame, t.last_seen_frame))
@@ -444,11 +464,37 @@ class GapTracker:
         # Some containers misreport CAP_PROP_FRAME_COUNT; trust what we read.
         total_frames = max(effective_frames, total_frames_meta if total_frames_meta > 0 else 0)
 
+        # Persist the gap-lifecycle audit for this camera (used by the Stage-1
+        # validation report + the [STAGE1] tracker-audit log line).
+        self.stats = {
+            "raw_yolo_boxes":   self._diag_total_yolo_boxes,
+            "after_class":      self._diag_after_class,
+            "after_confidence": self._diag_after_conf,
+            "candidates":       self._diag_kept,        # survived all filters
+            "after_nms":        self._diag_after_nms,   # per-frame deduped
+            "tracks_created":   self._diag_tracks_created,
+            "tracks_confirmed": self._diag_tracks_confirmed,
+            "tracks_rejected":  self._diag_tracks_created - self._diag_tracks_confirmed,
+            "tracks_merged":    self._diag_tracks_merged,
+            "final_gaps":       len(events),
+        }
+
         elapsed = time.time() - t0
         if self.verbose:
             print(f"[GapTracker/{self.camera_id}] done in {elapsed:.1f}s  "
                   f"emitted {len(events)} confirmed gaps  "
                   f"({frame_idx} frames processed)")
+            # Full gap-lifecycle audit: raw -> filtered -> deduped -> tracked ->
+            # confirmed -> merged -> final.  final == GapEvents == what the video
+            # annotates == boundaries fed to reconstruction.
+            s = self.stats
+            print(f"[STAGE1] {self.camera_id} gap lifecycle: "
+                  f"raw={s['raw_yolo_boxes']} -> class={s['after_class']} -> "
+                  f"conf={s['after_confidence']} -> candidates={s['candidates']} -> "
+                  f"nms={s['after_nms']} | tracks_created={s['tracks_created']} "
+                  f"confirmed={s['tracks_confirmed']} "
+                  f"rejected={s['tracks_rejected']} merged={s['tracks_merged']} "
+                  f"-> FINAL={s['final_gaps']}")
             # Filter-stage diagnostics -- helps spot "no bbox shown" cases.
             print(f"  YOLO boxes: total={self._diag_total_yolo_boxes}  "
                   f"after_class={self._diag_after_class}  "
@@ -513,7 +559,74 @@ class GapTracker:
                 "center_x": cx,
                 "height": h,
             })
+
+        # Same-frame NMS: one physical gap must yield ONE detection per frame.
+        # Without this, two overlapping YOLO boxes on the same gap would each
+        # spawn/feed a separate track -> duplicate gaps.  Distinct gaps sit at
+        # different x with low IoU, so they are never suppressed.
+        dets = self._nms_same_frame(dets)
+        self._diag_after_nms += len(dets)
         return dets
+
+    @staticmethod
+    def _bbox_iou(a: List[float], b: List[float]) -> float:
+        ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+        ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+        return inter / ua if ua > 0 else 0.0
+
+    def _nms_same_frame(self, dets: List[Dict[str, Any]],
+                        iou_thresh: float = 0.5) -> List[Dict[str, Any]]:
+        """Greedy IoU NMS, keeping the highest-confidence box in each cluster."""
+        kept: List[Dict[str, Any]] = []
+        for d in sorted(dets, key=lambda x: x["confidence"], reverse=True):
+            if all(self._bbox_iou(d["bbox"], k["bbox"]) < iou_thresh for k in kept):
+                kept.append(d)
+        return kept
+
+    def _merge_duplicate_tracks(self, tracks: List["_Track"]) -> List["_Track"]:
+        """Fold tracks that are the SAME physical gap into one stable track.
+
+        A candidate is absorbed into an existing kept track when their frame
+        spans OVERLAP (same gap alive under two ids) AND their mean x-centres are
+        within ``match_distance_px`` (same location).  Both conditions are
+        required, so two genuinely different gaps -- separated in time OR in x --
+        are never merged.  Absorbing preserves every hit (union of hit_frames /
+        bboxes / confidences) so no evidence is suppressed.
+        """
+        kept: List[_Track] = []
+        for tr in sorted(tracks, key=lambda t: (t.first_frame, t.last_seen_frame)):
+            tr_cx = float(np.mean(tr.centers)) if tr.centers else 0.0
+            target = None
+            for m in kept:
+                overlap = (min(m.last_seen_frame, tr.last_seen_frame)
+                           - max(m.first_frame, tr.first_frame))
+                if overlap <= 0:
+                    continue
+                m_cx = float(np.mean(m.centers)) if m.centers else 0.0
+                if abs(m_cx - tr_cx) <= self.match_distance_px:
+                    target = m
+                    break
+            if target is None:
+                kept.append(tr)
+                continue
+            # merge tr INTO target, de-duplicating shared hit frames
+            by_frame = dict(zip(target.hit_frames, zip(target.centers,
+                                                       target.confidences, target.bboxes)))
+            for f, cx, cf, bb in zip(tr.hit_frames, tr.centers, tr.confidences, tr.bboxes):
+                if f not in by_frame:
+                    by_frame[f] = (cx, cf, bb)
+            order = sorted(by_frame)
+            target.hit_frames = order
+            target.centers = [by_frame[f][0] for f in order]
+            target.confidences = [by_frame[f][1] for f in order]
+            target.bboxes = [by_frame[f][2] for f in order]
+            target.hit_count = len(order)
+            target.first_frame = min(target.first_frame, tr.first_frame)
+            target.last_seen_frame = max(target.last_seen_frame, tr.last_seen_frame)
+        return kept
 
 
 # =============================================================================
@@ -535,12 +648,18 @@ ENGINE_MIN_CONFIDENCE = 0.55
 
 
 class MasterClassifier:
-    """Classify master segments using side_classification.pt.
+    """Classify video segments into ENGINE / WAGON / BRAKE_VAN / UNKNOWN.
 
-    A *master segment* is the span between two consecutive RIGHT_UP gaps
-    (or between video start and the first gap / between the last gap and
-    video end).  For each segment we sample N frames evenly, run the
-    classifier, and majority-vote.
+    A *segment* is the span between two consecutive gaps of the driving camera
+    (or between video start and the first gap / between the last gap and video
+    end).  For each segment we sample N frames evenly, run the classifier, and
+    majority-vote.
+
+    This class is model-agnostic: RIGHT_UP drives it with side_classification.pt
+    (``tag="MASTER"``); the TOP cameras drive the SAME class with
+    top_classification.pt (``tag="TOP"``) to provide the extra semantic evidence
+    fused in ``assemble_global_train_state``.  The label mapping
+    (``_label_to_class``) is name-based, so it handles either model's class list.
     """
 
     def __init__(
@@ -549,7 +668,9 @@ class MasterClassifier:
         num_samples: int = 5,
         verbose: bool = True,
         device: Optional[str] = None,
+        tag: str = "MASTER",
     ):
+        self.tag = tag
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Classification model not found: {model_path}")
         import torch
@@ -607,7 +728,7 @@ class MasterClassifier:
                     confidence=conf,
                 ))
                 if self.verbose:
-                    print(f"[Classify/MASTER] segment {idx + 1}/"
+                    print(f"[Classify/{self.tag}] segment {idx + 1}/"
                           f"{len(segments)} frames {sf}-{ef} -> {seg_class} "
                           f"(raw='{label}', conf={conf:.2f})")
         finally:

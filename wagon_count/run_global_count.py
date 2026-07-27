@@ -78,6 +78,8 @@ from global_train_state import (
     CAMERA_RIGHT_UP,
     CAMERA_RIGHT_UP_TOP,
     CAMERA_LEFT_UP_TOP,
+    TOP_CAMERAS,
+    _MasterClassification,
     summarize_state,
 )
 from tracker_engine import GapTracker, MasterClassifier, segments_from_gaps
@@ -229,6 +231,38 @@ def _classify_master_pre_fusion(
     return clf.classify_segments(master_tracks.video_path, pre_segments)
 
 
+def _classify_top_regions(
+    top_tracks: LocalCameraTracks,
+    master_fps: float,
+    top_classification_model_path: str,
+    num_samples: int,
+    verbose: bool,
+) -> List[_MasterClassification]:
+    """Run top_classification.pt over ONE top camera and return the per-segment
+    ENGINE/WAGON/BRAKE_VAN labels re-expressed in MASTER frames.
+
+    Segments come from the top camera's OWN gaps (its local structure); the
+    labels are the extra semantic evidence fused into the Global Train.  Frames
+    are converted top->master via the shared-t=0 timebase so the labels line up
+    with each GlobalWagon's master-frame window in ``fuse_semantic_labels``.
+    """
+    segs = segments_from_gaps(top_tracks.gaps, top_tracks.total_frames)
+    if not segs:
+        return []
+    clf = MasterClassifier(top_classification_model_path, num_samples=num_samples,
+                           verbose=verbose, tag=f"TOP:{top_tracks.camera_id}")
+    local = clf.classify_segments(top_tracks.video_path, segs)   # top-frame ranges
+    top_fps = top_tracks.fps if top_tracks.fps > 0 else master_fps
+    scale = (master_fps / top_fps) if top_fps > 0 else 1.0
+    return [_MasterClassification(
+        segment_index=c.segment_index,
+        start_frame=int(round(c.start_frame * scale)),
+        end_frame=int(round(c.end_frame * scale)),
+        label=c.label,
+        confidence=c.confidence,
+    ) for c in local]
+
+
 # =============================================================================
 # CLI
 # =============================================================================
@@ -307,6 +341,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-raw-detections", action="store_true",
                    help="Don't keep raw per-frame detections in memory (saves RAM)")
     p.add_argument("--quiet", action="store_true", help="Reduce log verbosity")
+    p.add_argument("--stage1-debug", action="store_true",
+                   help="Debug visualization: overlay the raw per-frame candidate "
+                        "detections (cyan) on top of the final tracked gaps in the "
+                        "processed videos (also via WAGONEYE_STAGE1_DEBUG=true). "
+                        "Production shows only the final accepted gaps.")
     p.add_argument("--stage1-frame-trim-percent", type=float, default=None,
                    help="Ignore the first/last N%% of frames during Stage-1 "
                         "reconstruction only (default from "
@@ -392,6 +431,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     os.makedirs(frames_root, exist_ok=True)
 
     keep_raw = not args.no_raw_detections
+    stage1_debug = bool(args.stage1_debug) or os.getenv(
+        "WAGONEYE_STAGE1_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+    if stage1_debug:
+        print("[STAGE1] debug visualization ENABLED "
+              "(raw candidate detections overlaid on final gaps)")
 
     # ------------------------------------------------------------------
     # STEP 1 -- per-camera gap tracking (present cameras only)
@@ -451,6 +495,37 @@ def main(argv: Optional[List[str]] = None) -> int:
         initial_classifications = []
 
     # ------------------------------------------------------------------
+    # STEP 2b -- TOP-camera semantic classification (top_classification.pt)
+    # Extra evidence for the Global Train's ENGINE/WAGON/BRAKE_VAN labels.
+    # Runs only when the model is present (on EC2); skipped gracefully locally.
+    # ------------------------------------------------------------------
+    top_classifications: Dict[str, List[_MasterClassification]] = {}
+    try:
+        top_cls_path = _resolve_model("top_classification.pt", args.models_dir)
+    except FileNotFoundError:
+        top_cls_path = None   # optional evidence; absent locally, present on EC2
+    if top_cls_path:
+        print()
+        print("-" * 70)
+        print("  STEP 2b  Top-camera classification (top_classification.pt)")
+        print("-" * 70)
+        for cam in TOP_CAMERAS:
+            if cam not in tracks:
+                continue
+            try:
+                top_classifications[cam] = _classify_top_regions(
+                    tracks[cam], master_fps=tracks[master_cam].fps,
+                    top_classification_model_path=top_cls_path,
+                    num_samples=args.classification_samples, verbose=verbose,
+                )
+            except Exception as e:
+                print(f"WARNING: top classification failed for {cam}: {e}",
+                      file=sys.stderr)
+    else:
+        print("[STAGE1] top_classification.pt not found in models dir; "
+              "top semantic evidence disabled (gap-only classification).")
+
+    # ------------------------------------------------------------------
     # STEP 3 -- cross-camera fusion (support = present non-master cameras)
     # ------------------------------------------------------------------
     print()
@@ -470,6 +545,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         master_tracks=master,
         support_tracks=support,
         initial_classifications=initial_classifications,
+        top_classifications=top_classifications,
         config=fuse_cfg,
         verbose=verbose,
     )
@@ -539,6 +615,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     output_path=out_mp4,
                     draw_raw_detections=keep_raw,
                     verbose=verbose,
+                    debug=stage1_debug,
                 )
             except Exception as e:
                 print(f"WARNING: render failed for {cam}: {e}", file=sys.stderr)

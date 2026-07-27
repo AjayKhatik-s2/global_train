@@ -169,11 +169,19 @@ def render_processed_video(
     output_path: str,
     draw_raw_detections: bool = True,
     verbose: bool = True,
+    debug: bool = False,
 ) -> str:
     """Render the overlay video for ONE camera.
 
+    ``debug`` (WAGONEYE_STAGE1_DEBUG / --stage1-debug) turns on the full Stage-1
+    lifecycle overlay: the CYAN raw per-frame candidate detections are shown on
+    top of the final tracked gaps so raw-vs-final is directly visible.  In
+    production (``debug=False``) only the FINAL accepted tracked gaps + fused
+    boundaries are drawn -- exactly the gaps fed to reconstruction.
+
     Returns the output path.  Creates parent directory if needed.
     """
+    show_raw = bool(debug and draw_raw_detections)
     if local_tracks.fps <= 0:
         raise ValueError(f"Cannot render: invalid fps for {local_tracks.camera_id}")
 
@@ -195,7 +203,12 @@ def render_processed_video(
         cap.release()
         raise RuntimeError(f"Cannot open video writer at {output_path}")
 
-    # Precompute frame -> active GapEvent (camera's own tracked gaps)
+    # Precompute frame -> active GapEvent (camera's own tracked gaps) + a stable
+    # running Gap # (1..N by first appearance) for the labels + live counter.
+    ordered_gaps = sorted(local_tracks.gaps, key=lambda g: (g.start_frame, g.end_frame))
+    gap_num = {id(g): i for i, g in enumerate(ordered_gaps, start=1)}
+    gap_starts = [g.start_frame for g in ordered_gaps]
+    n_gaps = len(ordered_gaps)
     frame_to_active_gap: Dict[int, GapEvent] = {}
     for g in local_tracks.gaps:
         for f in range(g.start_frame, g.end_frame + 1):
@@ -211,11 +224,13 @@ def render_processed_video(
     # the corrected boundary thanks to fusion.
     frame_to_wagon: Dict[int, GlobalWagon] = {}
     boundary_frames: List[int] = []
+    boundary_wagon: Dict[int, str] = {}     # boundary frame -> the GW it introduces
     for w in state.wagons:
         sf, ef = wagon_ranges[w.global_id]
         for f in range(sf, ef + 1):
             frame_to_wagon[f] = w
         boundary_frames.append(sf)
+        boundary_wagon[sf] = w.global_id
     # The very first boundary at frame 0 is implicit; skip drawing it
     boundary_frames = sorted(set(b for b in boundary_frames if b > 0))
 
@@ -237,8 +252,8 @@ def render_processed_video(
                 cv2.line(frame, (0, frame.shape[0] - 1),
                          (frame.shape[1], frame.shape[0] - 1),
                          _BOUNDARY_COLOR, 4)
-                # Centered banner: "GW_BOUNDARY"
-                label = "GW_BOUNDARY"
+                # Centered banner names the canonical wagon this boundary starts
+                label = f"GW_BOUNDARY | {boundary_wagon.get(b, '')}"
                 (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
                 tx = max(0, (frame.shape[1] - tw) // 2)
                 ty = th + 16
@@ -264,18 +279,19 @@ def render_processed_video(
             if interp_bbox is not None:
                 x1, y1, x2, y2 = [int(v) for v in interp_bbox]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), _TRACKED_GAP_COLOR, 2)
-                # Two-line label above the bbox
-                cv2.putText(frame, f"TRACKED_GAP #{active_gap.track_id}",
+                # Gap # (running order) + stable Track id + confidence
+                cv2.putText(frame, f"Gap #{gap_num.get(id(active_gap), '?')} "
+                                   f"Track {active_gap.track_id}",
                             (x1, max(0, y1 - 24)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, _TRACKED_GAP_COLOR, 2, cv2.LINE_AA)
-                cv2.putText(frame, f"conf={active_gap.confidence:.2f}",
+                cv2.putText(frame, f"Conf: {active_gap.confidence:.2f}",
                             (x1, max(0, y1 - 6)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, _TRACKED_GAP_COLOR, 2, cv2.LINE_AA)
 
-        # CYAN raw YOLO per-frame detections, drawn ON TOP of the tracked
-        # box.  Label uses "RAW / conf=X" so it is visually distinguishable
-        # from the tracked box even if both colors are present.
-        if draw_raw_detections:
+        # DEBUG only: CYAN raw YOLO per-frame candidate detections, drawn ON TOP
+        # of the tracked box so raw-vs-final is directly visible.  Hidden in
+        # production so the video shows ONLY the final accepted gaps.
+        if show_raw:
             for det in local_tracks.raw_frame_detections.get(frame_idx, []):
                 x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), _GAP_COLOR, 2)
@@ -308,6 +324,12 @@ def render_processed_video(
             info_lines.append(("Classification:       —", _INFO_TEXT_COLOR))
         info_lines.append((f"Total Global Wagons:  {state.total_wagons}",
                            _INFO_TEXT_COLOR))
+        # Live accepted-gap counter: reaches n_gaps by the end of the clip.
+        detected = sum(1 for s in gap_starts if s <= frame_idx)
+        info_lines.append((f"Detected Gaps:        {detected} / {n_gaps}",
+                           _TRACKED_GAP_COLOR))
+        if debug:
+            info_lines.append(("DEBUG: raw(cyan)+tracked(yellow)+final", _GAP_COLOR))
         if state.fallback_used:
             info_lines.append(("FALLBACK MODE (pure RIGHT_UP)", (0, 0, 255)))
 

@@ -50,6 +50,7 @@ import cv2
 
 from core import constants as C
 from core.global_state_loader import GlobalTrainState, GlobalWagon
+from rendering import gap_overlay
 from core.unified_wagon_state import UnifiedWagonState
 
 
@@ -374,6 +375,18 @@ def _render_one_camera(
             for f in range(sf, ef + 1):
                 frame_to_wagon[f] = w
 
+    # Stage-1 gap overlay (all four cameras).  Boundary lines come from the FUSED
+    # wagon time windows mapped to this camera's local frames (same arithmetic as
+    # Stage 1); the tracked-gap bboxes are this camera's FINAL gaps replayed from
+    # per_camera_tracking.json.  No reconstruction is re-run -- both are consumed
+    # from already-computed, persisted results.
+    gap_boundary_frames: List[int] = sorted({
+        _map_wagon_to_local_frames(w, src_fps, total)[0]
+        for w in state.wagons
+        if _map_wagon_to_local_frames(w, src_fps, total)[0] > 0
+    })
+    gap_by_frame = gap_overlay.build_gap_frame_index(camera_meta.get("gaps") or [])
+
     overlay = _OverlayRegistry(
         camera_id=camera_id, evidence_root=evidence_root, wagons=state.wagons,
         enabled_features=enabled_features,
@@ -407,6 +420,9 @@ def _render_one_camera(
             w = frame_to_wagon.get(frame_idx)
             frame_class = str(w.classification).upper() if w else "WAGON"
             _draw_damage_info(frame, frame_idx, n_damages, frame_class)
+
+        # Stage-1 gaps LAST so they overlay (never replace) the feature boxes.
+        gap_overlay.draw_gap_overlays(frame, frame_idx, gap_by_frame, gap_boundary_frames)
 
         writer.write(frame)
         written += 1

@@ -76,6 +76,9 @@ from features.inference_lib.illumination_processor import (
 from features.inference_lib.geometric_shape_prior import (
     GeometricShapePrior, GeometricPriorConfig,
 )
+from features.inference_lib.snapshot_selector import (
+    refined_crop_around_detection, annotate_snapshot,
+)
 from features._evidence import (
     BestFrameTracker, atomic_camera_evidence,
     save_jpeg, safe_crop, write_metadata, draw_annotated_bbox,
@@ -83,6 +86,21 @@ from features._evidence import (
 
 
 FEATURE_NAME = "door"
+
+# Report door-snapshot colours -- verbatim from old production
+# door_processor.py:272 (STATE_COLORS_BGR).  The old per-camera report drew the
+# door snapshot as a REFINED CROP around the detection (refined_crop_around_
+# detection, 40% expand / min-60%-frame / fallback ROI) with the bbox + a
+# "Door #N: STATE (conf%)" label annotated ON the crop (annotate_snapshot).  We
+# reproduce that exact image here so the side report's door-detail/priority
+# pages show old's annotated crop (not a bare "[Snapshot not available]").
+STATE_COLORS_BGR = {
+    'open_door': (0, 0, 255), 'open': (0, 0, 255),
+    'closed_door': (0, 255, 0), 'closed': (0, 255, 0),
+    'closed_with_wire': (0, 255, 255), 'partial_closed': (0, 255, 255),
+    'partially_closed': (0, 255, 255), 'damage': (0, 0, 255),
+    'other': (255, 165, 0), 'unknown': (128, 128, 128),
+}
 log = get_logger("features.door")
 
 
@@ -478,6 +496,18 @@ def _process_wagon_camera_door(
                 save_jpeg(os.path.join(ev_tmp, f"{side}_best.jpg"), annotated)
                 if crop_img is not None:
                     save_jpeg(os.path.join(ev_tmp, f"{side}_crop.jpg"), crop_img)
+                # OLD-PRODUCTION report door snapshot: refined crop centred on the
+                # detection, then the bbox + "Door #N: STATE (conf%)" label drawn
+                # ON the crop (door_processor.py:1629-1641).  This is the image the
+                # side report's door-detail / priority pages embed.
+                _cropped, _adj = refined_crop_around_detection(
+                    best.frame, np.asarray(best.bbox, dtype=float))
+                _snap = annotate_snapshot(
+                    _cropped, _adj, door_id=1,
+                    door_state=str(best.meta.get("state") or "unknown"),
+                    state_colors=STATE_COLORS_BGR,
+                    confidence=float(best.meta.get("confidence") or 0.0))
+                save_jpeg(os.path.join(ev_tmp, f"{side}_snapshot.jpg"), _snap)
                 write_metadata(os.path.join(ev_tmp, "metadata.json"), {
                     "global_id": gw_id, "feature": FEATURE_NAME,
                     "camera_id": camera_id, "side": side,
@@ -498,6 +528,7 @@ def _process_wagon_camera_door(
                 })
         if best.has_data():
             evidence_paths[f"{side}_best"] = os.path.join(final_dir, f"{side}_best.jpg")
+            evidence_paths[f"{side}_snapshot"] = os.path.join(final_dir, f"{side}_snapshot.jpg")
             if crop_img is not None:
                 evidence_paths[f"{side}_crop"] = os.path.join(final_dir, f"{side}_crop.jpg")
 

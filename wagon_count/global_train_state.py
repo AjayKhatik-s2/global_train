@@ -120,6 +120,13 @@ class GapEvent:
             "hit_count": self.hit_count,
             "temporal_consistency_score": round(self.temporal_consistency_score, 4),
             "class_label": self.class_label,
+            # Per-hit image-plane trajectory of THIS gap track (already computed
+            # by the tracker; not part of reconstruction -- exposed so the
+            # processed-video renderer can replay the exact tracked-gap bbox on
+            # every frame without re-running Stage 1).  hit_frames[i] pairs with
+            # bbox_history[i] = [x1, y1, x2, y2].
+            "hit_frames": [int(f) for f in self.hit_frames],
+            "bbox_history": [[round(float(v), 2) for v in b] for b in self.bbox_history],
         }
 
 

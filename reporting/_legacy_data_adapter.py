@@ -109,6 +109,19 @@ def _local_frames(meta: Dict[str, Any], gw) -> Sequence[int]:
     )
 
 
+def _load_image(path: Optional[str]):
+    """Load an evidence snapshot as a BGR numpy array (old passed the door/damage
+    snapshot in-memory, not as a path).  cv2 is imported lazily so the reportlab-
+    only report path never eagerly pulls in OpenCV; returns None on any failure."""
+    if not path:
+        return None
+    try:
+        import cv2
+        return cv2.imread(path)
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Per-camera builders
 # ---------------------------------------------------------------------------
@@ -165,8 +178,14 @@ def _side_camera_payload(
             counts["CLOSED"] += 1
 
         # snapshot only meaningful for open/damage (the images page filters anyway)
+        # `local_snapshot_path` -> the full annotated frame (combined report reads
+        # it as a path).  `snapshot` -> the OLD refined+annotated door CROP loaded
+        # as a numpy array, which is what the per-camera side generator embeds on
+        # its door-detail / priority pages (it reads door['snapshot'], not a path).
         snap = ev.evidence_snapshot(evidence_root, gw.global_id, "door",
                                     f"{side}_best", camera_id=camera_id)
+        crop = ev.evidence_snapshot(evidence_root, gw.global_id, "door",
+                                    f"{side}_snapshot", camera_id=camera_id)
         doors.append({
             "wagon_number":        idx,
             "global_id":           gw.global_id,
@@ -176,6 +195,7 @@ def _side_camera_payload(
             "confidence":          d_conf,
             "open_event_raised":   True,
             "local_snapshot_path": snap,
+            "snapshot":            _load_image(crop),
         })
 
     return {"wagon_summary": wagon_summary, "doors": doors, "state_counts": counts}
@@ -212,13 +232,22 @@ def _top_camera_payload(
         for snap_path, tr in ev.damage_track_snapshots(
                 evidence_root, gw.global_id, camera_id=camera_id):
             cls = str(tr.get("class_name") or "damage").lower()
+            # `snapshot` = the OLD annotate-then-crop report image (numpy); the
+            # top generator reads damage['snapshot'] for its damage-detail /
+            # priority pages.  `local_snapshot_path` (annotated full frame) is
+            # kept for the combined report, which reads it as a path.
+            crop = ev.evidence_snapshot(
+                evidence_root, gw.global_id, "damage",
+                f"track_{int(tr.get('track_idx') or 0)}_snapshot", camera_id=camera_id)
             damages.append({
                 "wagon_number":        idx,
                 "global_id":           gw.global_id,
+                "damage_id":           int(tr.get("track_idx") or (len(damages) + 1)),
                 "damage_number":       int(tr.get("track_idx") or (len(damages) + 1)),
                 "state":               cls,
                 "confidence":          float(tr.get("best_confidence") or 0.0),
                 "local_snapshot_path": snap_path,
+                "snapshot":            _load_image(crop),
                 "frame_idx":           tr.get("best_frame_idx"),
                 "bbox":                tr.get("bbox"),
             })

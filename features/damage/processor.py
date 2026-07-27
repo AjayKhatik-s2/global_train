@@ -49,6 +49,7 @@ import time
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 
 from core import constants as C
@@ -72,6 +73,67 @@ from features._evidence import (
 
 
 FEATURE_NAME = "damage"
+
+
+def _crop_around_detection(
+    frame: np.ndarray, bbox, padding_factor: float = 1.5,
+    min_width: int = 640, min_height: int = 480, label_extra_top: int = 60,
+) -> np.ndarray:
+    """Verbatim port of old production damage_processor.py:_crop_around_detection
+    -- crop the frame centred on the detection so the damage sits in the middle
+    (1.5x padding, min 640x480, shift-to-fit, 50px minimum-size guard).  Used to
+    reproduce the old per-camera damage report snapshot (annotate-then-crop)."""
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    bbox_w = max(x2 - x1, 1)
+    bbox_h = max(y2 - y1, 1)
+    pad_x = int(bbox_w * padding_factor)
+    pad_y = int(bbox_h * padding_factor)
+    pad_y_top = pad_y + label_extra_top
+    crop_x1, crop_y1 = x1 - pad_x, y1 - pad_y_top
+    crop_x2, crop_y2 = x2 + pad_x, y2 + pad_y
+    crop_w, crop_h = crop_x2 - crop_x1, crop_y2 - crop_y1
+    if crop_w < min_width:
+        expand = (min_width - crop_w) // 2
+        crop_x1 -= expand; crop_x2 += expand
+    if crop_h < min_height:
+        expand = (min_height - crop_h) // 2
+        crop_y1 -= expand; crop_y2 += expand
+    if crop_x1 < 0:
+        shift = -crop_x1; crop_x1 += shift; crop_x2 += shift
+    if crop_y1 < 0:
+        shift = -crop_y1; crop_y1 += shift; crop_y2 += shift
+    if crop_x2 > w:
+        shift = crop_x2 - w; crop_x1 = max(0, crop_x1 - shift); crop_x2 = w
+    if crop_y2 > h:
+        shift = crop_y2 - h; crop_y1 = max(0, crop_y1 - shift); crop_y2 = h
+    crop_x1 = max(0, crop_x1); crop_y1 = max(0, crop_y1)
+    crop_x2 = min(w, crop_x2); crop_y2 = min(h, crop_y2)
+    if crop_x2 - crop_x1 < 50 or crop_y2 - crop_y1 < 50:
+        return frame
+    return frame[crop_y1:crop_y2, crop_x1:crop_x2].copy()
+
+
+def _damage_report_snapshot(snap: np.ndarray, bbox, class_name: str,
+                            confidence: float) -> np.ndarray:
+    """Reproduce old production's per-camera damage report snapshot
+    (damage_processor.py:1213-1236): draw a thick red bbox + a
+    "<class> (<conf>%)" label on the best frame, THEN crop around the
+    detection so the damage is centred."""
+    annotated = snap.copy()
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 4)
+    label = f"{class_name} ({confidence:.0%})"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.8
+    thickness = 2
+    (text_w, text_h), _ = cv2.getTextSize(label, font, font_scale, thickness)
+    label_y = max(y1 - 10, text_h + 10)
+    cv2.rectangle(annotated, (x1, label_y - text_h - 10),
+                  (x1 + text_w + 10, label_y + 5), (0, 0, 255), -1)
+    cv2.putText(annotated, label, (x1 + 5, label_y),
+                font, font_scale, (255, 255, 255), thickness)
+    return _crop_around_detection(annotated, bbox)
 log = get_logger("features.damage")
 
 
@@ -405,7 +467,14 @@ def _process_wagon_camera_damage(
                 crop_img = safe_crop(snap, tr.get("bbox"), pad=10)
                 if crop_img is not None:
                     save_jpeg(os.path.join(ev_tmp, f"track_{i}_crop.jpg"), crop_img)
+                # OLD-PRODUCTION report damage snapshot (annotate-then-crop): the
+                # image the top report's damage-detail / priority pages embed.
+                report_snap = _damage_report_snapshot(
+                    snap, tr.get("bbox"), tr["class_name"], tr["best_confidence"])
+                save_jpeg(os.path.join(ev_tmp, f"track_{i}_snapshot.jpg"), report_snap)
                 evidence_paths[f"track_{i}"] = os.path.join(final_dir, f"track_{i}.jpg")
+                evidence_paths[f"track_{i}_snapshot"] = os.path.join(
+                    final_dir, f"track_{i}_snapshot.jpg")
                 if crop_img is not None:
                     evidence_paths[f"track_{i}_crop"] = os.path.join(
                         final_dir, f"track_{i}_crop.jpg")

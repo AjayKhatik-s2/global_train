@@ -22,7 +22,8 @@ yields the same output.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass, field, replace
 from typing import List, Dict, Optional, Tuple, Any
 
 from global_train_state import (
@@ -70,12 +71,58 @@ PHASE1_DEFAULTS = {
     "match_time_window_sec": 1.0,
     "match_min_iou": 0.2,
 
-    # Inserting a missed master gap (gap-recovery quorum)
+    # Inserting a missed master gap (gap-recovery quorum) -- DISABLED under the
+    # canonical rule (kept for reference only; see fuse_master_timeline).
     "insert_min_support": 2,
     "insert_max_spread_sec": 1.5,
     "insert_min_confidence": 0.4,
     "insert_min_distance_to_master_sec": 1.0,
+
+    # --- Confidence-weighted boundary refinement (Stage-1 redesign) ----------
+    # A trusted TOP camera may NUDGE a canonical boundary toward its own gap
+    # when it agrees within `boundary_refine_window_sec`; the nudge is a
+    # weighted average and is clamped to `boundary_refine_max_shift_sec` so a
+    # refiner can never move a boundary far enough to reorder or drop one.
+    "boundary_refine_window_sec": 0.5,
+    "boundary_refine_max_shift_sec": 0.5,
 }
+
+
+# -----------------------------------------------------------------------------
+# Confidence-weighted camera trust (Stage-1 redesign)
+# -----------------------------------------------------------------------------
+# RIGHT_UP is the CANONICAL master: it alone defines the wagon count, the Global
+# Wagon IDs, and the initial boundaries.  RIGHT_UP_TOP and LEFT_UP_TOP are
+# TRUSTED REFINERS: they may only nudge an existing boundary's position (never
+# add/delete a wagon).  LEFT_UP has trust 0.0 for gap detection -- its gaps are
+# IGNORED for boundaries; it contributes only the train start/end envelope
+# (weight 1.0 there) plus downstream feature evidence.  Override per camera via
+# config["gap_trust_weights"] or the WAGONEYE_GAP_TRUST_<CAMERA> env var.
+DEFAULT_GAP_TRUST_WEIGHTS: Dict[str, float] = {
+    "RIGHT_UP":     1.0,   # canonical master
+    "RIGHT_UP_TOP": 0.9,   # trusted refiner
+    "LEFT_UP_TOP":  0.9,   # trusted refiner
+    "LEFT_UP":      0.0,   # NOT a gap source (start/end + features only)
+}
+
+
+def resolve_gap_trust_weights(config: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
+    """Merge default trust weights with config + WAGONEYE_GAP_TRUST_<CAM> env."""
+    w = dict(DEFAULT_GAP_TRUST_WEIGHTS)
+    if config and isinstance(config.get("gap_trust_weights"), dict):
+        for k, v in config["gap_trust_weights"].items():
+            try:
+                w[k] = float(v)
+            except (TypeError, ValueError):
+                pass
+    for cam in ALL_CAMERAS:
+        env = os.environ.get(f"WAGONEYE_GAP_TRUST_{cam}")
+        if env is not None:
+            try:
+                w[cam] = float(env)
+            except ValueError:
+                pass
+    return w
 
 
 # -----------------------------------------------------------------------------
@@ -439,6 +486,93 @@ def build_wagons_pure_master(
 
 
 # -----------------------------------------------------------------------------
+# Step F2 -- confidence-weighted boundary refinement (trusted TOP cameras)
+# -----------------------------------------------------------------------------
+
+def _nearest_wagon_id(wagons: List[GlobalWagon], frame: float) -> str:
+    if not wagons:
+        return "GW_?"
+    return min(wagons, key=lambda w: abs(w.start_frame_master - frame)).global_id
+
+
+def projection_camera_envelope(tracks: LocalCameraTracks) -> Tuple[int, int]:
+    """Train start/end FRAME envelope for a projection-only camera (LEFT_UP).
+
+    LEFT_UP's individual gaps are NOT trusted for boundaries, but the OUTER span
+    of its detected activity reliably brackets where the train enters and leaves
+    view.  Falls back to the whole clip if it detected nothing."""
+    if tracks.gaps:
+        return (min(int(g.start_frame) for g in tracks.gaps),
+                max(int(g.end_frame) for g in tracks.gaps))
+    return 0, max(0, tracks.total_frames - 1)
+
+
+def refine_master_boundaries(
+    master_tracks: LocalCameraTracks,
+    refiner_tracks: List[LocalCameraTracks],
+    weights: Dict[str, float],
+    *,
+    window_sec: float,
+    max_shift_sec: float,
+) -> Tuple[List[GapEvent], List[Dict[str, Any]]]:
+    """Refine every canonical (master) boundary with the TRUSTED refiner cameras.
+
+    For each master gap we form a trust-weighted average of its center with any
+    refiner gap that agrees within ``window_sec``.  Cameras share t=0 after the
+    Stage-1 frame trim, so the comparison + averaging happen in the master time
+    domain.  The resulting shift is clamped to ``max_shift_sec`` AND to stay
+    strictly between the neighbouring boundaries, so the wagon COUNT and ordering
+    are preserved exactly -- a refiner can only MOVE a boundary, never create,
+    delete, split, or merge one.
+
+    Returns ``(refined_gaps, logs)`` where ``logs[i]`` records the refined frame,
+    the applied shift, and per-refiner the matching-gap offset (or ``None``).
+    """
+    m_fps = master_tracks.fps if master_tracks.fps > 0 else 1.0
+    # The canonical master ALWAYS anchors its own boundary with weight 1.0.  The
+    # trust table applies to the *refiner* role only (so LEFT_UP=0.0 disables it
+    # as a support gap source, yet it keeps full authority if it is ever forced
+    # to be the fallback master).
+    w_master = 1.0
+    ordered = sorted(master_tracks.gaps, key=lambda g: g.center_time)
+    n = len(ordered)
+    max_shift = max_shift_sec * m_fps
+    refined: List[GapEvent] = []
+    logs: List[Dict[str, Any]] = []
+    prev_center = 0.0
+    for i, g in enumerate(ordered):
+        F, T = g.center_frame, g.center_time
+        num, den = w_master * F, w_master
+        matches: Dict[str, Optional[float]] = {}
+        for rt in refiner_tracks:
+            w_c = float(weights.get(rt.camera_id, 0.0))
+            if w_c <= 0.0 or not rt.gaps:
+                matches[rt.camera_id] = None
+                continue
+            best = min(rt.gaps, key=lambda gc: abs(gc.center_time - T))
+            if abs(best.center_time - T) <= window_sec:
+                f_c = best.center_time * m_fps          # -> master frames
+                num += w_c * f_c
+                den += w_c
+                matches[rt.camera_id] = f_c - F
+            else:
+                matches[rt.camera_id] = None
+        F_new = num / den if den > 0 else F
+        # clamp the magnitude of the nudge ...
+        F_new = max(F - max_shift, min(F + max_shift, F_new))
+        # ... and keep boundaries strictly ordered (count + sequence preserved)
+        nxt = ordered[i + 1].center_frame if i + 1 < n else float(master_tracks.total_frames)
+        lo, hi = prev_center + 1.0, nxt - 1.0
+        F_new = max(lo, min(hi, F_new)) if lo <= hi else F
+        prev_center = F_new
+        shift = F_new - F
+        refined.append(replace(g, start_frame=int(round(g.start_frame + shift)),
+                               end_frame=int(round(g.end_frame + shift))))
+        logs.append({"orig": F, "refined": F_new, "shift": shift, "matches": matches})
+    return refined, logs
+
+
+# -----------------------------------------------------------------------------
 # Step G -- end-to-end
 # -----------------------------------------------------------------------------
 
@@ -470,35 +604,47 @@ def assemble_global_train_state(
                   f"gaps={len(st.gaps)}")
 
     # =====================================================================
-    # CANONICAL RULE -- the master (RIGHT_UP) is the SOLE authority for the
-    # wagon COUNT and the wagon NUMBERING.  Global Wagons are reconstructed
-    # from the MASTER's gaps ONLY; support cameras can NEVER add, delete, or
-    # renumber a wagon.  They are matched here purely to (a) report how many
-    # canonical wagons each corroborates and (b) surface any extra detection
-    # as UNMATCHED EVIDENCE.  GW_i therefore corresponds one-to-one with the
-    # master's wagon sequence.  (Ownership requirements 1-8.)
-    #
-    # `fuse_master_timeline` / `decide_inserted_gaps` (support-gap insertion)
-    # are intentionally NOT invoked -- they are retained only for reference.
+    # CONFIDENCE-WEIGHTED RECONSTRUCTION (Stage-1 redesign)
+    #   RIGHT_UP      -> CANONICAL master: sole authority for the wagon COUNT,
+    #                    the Global Wagon IDs, and the initial boundaries.
+    #   RIGHT_UP_TOP, -> TRUSTED REFINERS (trust > 0): may only NUDGE an existing
+    #   LEFT_UP_TOP      boundary's position; NEVER add/delete/split/merge one.
+    #   LEFT_UP       -> trust 0.0 for gaps: its gaps are IGNORED for boundaries;
+    #                    it supplies only the train start/end envelope + the
+    #                    downstream feature evidence.
+    # Support cameras can NEVER change the wagon count or numbering, so GW_i is
+    # one-to-one with the master's wagon sequence.  Support-gap INSERTION
+    # (fuse_master_timeline) stays disabled.
     # =====================================================================
-    support_ids = [st.camera_id for st in support_tracks]
+    weights = resolve_gap_trust_weights(config)
+    master_id = master_tracks.camera_id
+    refiner_tracks = [st for st in support_tracks if weights.get(st.camera_id, 0.0) > 0.0]
+    projection_tracks = [st for st in support_tracks if weights.get(st.camera_id, 0.0) <= 0.0]
+
     fallback_used = False
     fallback_reason = ""
+    refine_logs: List[Dict[str, Any]] = []
     try:
+        refined_gaps, refine_logs = refine_master_boundaries(
+            master_tracks, refiner_tracks, weights,
+            window_sec=cfg["boundary_refine_window_sec"],
+            max_shift_sec=cfg["boundary_refine_max_shift_sec"],
+        )
         wagons = build_global_wagons(
-            sorted(master_tracks.gaps, key=lambda g: g.center_time),
+            refined_gaps,
             master_total_frames=master_tracks.total_frames,
             master_fps=master_tracks.fps,
             initial_classifications=initial_classifications,
-            support_camera_ids=support_ids,
-            master_camera_id=master_tracks.camera_id,
+            support_camera_ids=[st.camera_id for st in support_tracks],
+            master_camera_id=master_id,
         )
     except Exception as e:
         fallback_used = True
-        fallback_reason = f"master wagon build error: {type(e).__name__}: {e}"
+        fallback_reason = f"reconstruction error: {type(e).__name__}: {e}"
         if verbose:
-            print(f"[FUSE] {fallback_reason}")
-        wagons = []
+            print(f"[STAGE1] {fallback_reason} -- falling back to raw master gaps")
+        refine_logs = []
+        wagons = build_wagons_pure_master(master_tracks, initial_classifications)
     if not wagons and master_tracks.total_frames > 0 and master_tracks.gaps:
         fallback_used = True
         if not fallback_reason:
@@ -506,34 +652,54 @@ def assemble_global_train_state(
 
     total = len(wagons)
 
-    # ---- support corroboration audit (NEVER changes count or numbering) ----
+    # LEFT_UP (and any weight-0 camera): train envelope only -> stored as a note
+    notes: List[str] = []
+    for pt in projection_tracks:
+        s0, s1 = projection_camera_envelope(pt)
+        per_status[pt.camera_id] = "projected_only"
+        notes.append(f"{pt.camera_id}_train_envelope_frames={s0}..{s1}")
+
+    # ---------------- [STAGE1] validation logs ----------------
     if verbose:
-        print(f"[STAGE1] Master camera: {master_tracks.camera_id}")
-        print(f"[STAGE1] Canonical wagon count: {total} ({master_tracks.camera_id})")
-    for st in support_tracks:
+        print(f"[STAGE1] Canonical camera: {master_id}")
+        print(f"[STAGE1] Canonical wagon count: {total} ({master_id})")
+        seen = [master_id] + [s.camera_id for s in support_tracks]
+        print("[STAGE1] Trust weights (gap): "
+              + ", ".join(f"{c}={weights.get(c, 0.0):.1f}" for c in ALL_CAMERAS if c in seen))
+        for lg in refine_logs:
+            gw = _nearest_wagon_id(wagons, lg["refined"])
+            parts = [f"{master_id}: accepted"]
+            for rt in refiner_tracks:
+                off = lg["matches"].get(rt.camera_id)
+                parts.append(f"{rt.camera_id}: "
+                             + (f"matched ({off:+.0f}f)" if off is not None else "no-match"))
+            for pt in projection_tracks:
+                parts.append(f"{pt.camera_id}: projected-only (gap ignored)")
+            tail = f"shift {lg['shift']:+.0f}f" if abs(lg["shift"]) >= 0.5 else "unchanged"
+            print(f"[STAGE1] Boundary {gw} @f{int(round(lg['refined']))}: "
+                  + " | ".join(parts) + f" -> {tail}")
+        for pt in projection_tracks:
+            s0, s1 = projection_camera_envelope(pt)
+            print(f"[STAGE1] {pt.camera_id}: projected-only "
+                  f"(train envelope frames {s0}..{s1}; gaps excluded from boundaries)")
+
+    # refiner corroboration summary (audit only -- cannot change count/numbering)
+    for rt in refiner_tracks:
         matched, leftover = match_support_to_master(
-            master_tracks.gaps, st.gaps,
+            master_tracks.gaps, rt.gaps,
             match_time_window_sec=cfg["match_time_window_sec"],
-            match_min_iou=cfg["match_min_iou"],
-        )
-        # distinct master boundaries this camera corroborated.  Each master
-        # boundary the support MISSED is one canonical wagon it did not
-        # distinctly confirm, so matched_wagons drops by exactly that many.
+            match_min_iou=cfg["match_min_iou"])
         boundaries_matched = len(set(matched.values()))
-        missing_boundaries = max(0, len(master_tracks.gaps) - boundaries_matched)
-        matched_wagons = max(0, total - missing_boundaries)
+        matched_wagons = max(0, total - max(0, len(master_tracks.gaps) - boundaries_matched))
         if matched_wagons < total:
-            # requirement 6: wagon stays (it is the master's); the camera is
-            # simply marked as missing evidence for the wagons it did not see.
-            per_status[st.camera_id] = "missing_evidence"
+            per_status[rt.camera_id] = "missing_evidence"
         if verbose:
-            # requirement 5: extra support detections are UNMATCHED EVIDENCE,
-            # never a new Global Wagon.
             extra = f"  (+{len(leftover)} unmatched evidence)" if leftover else ""
-            print(f"[STAGE1] {st.camera_id} matched: {matched_wagons}/{total}{extra}")
+            print(f"[STAGE1] {rt.camera_id} matched: {matched_wagons}/{total}{extra}")
+
     if verbose:
-        print(f"[STAGE1] Final Global Train: {total} wagons "
-              f"({master_tracks.camera_id} canonical)")
+        print(f"[STAGE1] Global boundaries finalized -- Final Global Train: "
+              f"{total} wagons ({master_id} canonical)")
 
     state = GlobalTrainState(
         total_wagons=total,
@@ -544,9 +710,10 @@ def assemble_global_train_state(
         per_camera_local_counts=per_local_counts,
         per_camera_gap_counts=per_gap_counts,
         per_camera_status=per_status,
-        # support cameras never insert a gap under the canonical rule
+        # support cameras never insert a gap; refiners only nudge positions
         corrections_applied=[],
         fallback_used=fallback_used,
         fallback_reason=fallback_reason,
+        notes=notes,
     )
     return state

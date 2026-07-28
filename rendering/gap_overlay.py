@@ -104,14 +104,17 @@ def draw_gap_overlays(
     *,
     all_gaps: Optional[Sequence[Dict[str, Any]]] = None,
     show_counter: bool = True,
+    owner: Optional[str] = None,
 ) -> None:
     """Overlay the Stage-1 gaps for ONE frame, IN PLACE, on top of the feature
     annotations:
 
-      * magenta boundary flash + ``GW_BOUNDARY`` within +/-3 frames of a fused
-        wagon boundary;
+      * magenta boundary flash + ``GW_BOUNDARY -> <owner>`` within +/-3 frames of
+        a fused wagon boundary (the OWNERSHIP-transition frame);
       * cyan interpolated bbox for the active tracked gap, labelled
         ``Gap #<n> | Track <id> | Conf: <c>``;
+      * a white OWNERSHIP DIVIDER (vertical line at the gap's centre_x) + an
+        ``Owner: <GW>`` tag, so it is visible which single wagon owns this frame;
       * a live ``Detected Gaps: k/N`` counter (top-right).
     """
     h, w = frame.shape[:2]
@@ -120,7 +123,7 @@ def draw_gap_overlays(
         if abs(int(b) - frame_idx) <= 3:
             cv2.line(frame, (0, 0), (w, 0), BOUNDARY_COLOR, 4)
             cv2.line(frame, (0, h - 1), (w, h - 1), BOUNDARY_COLOR, 4)
-            label = "GW_BOUNDARY"
+            label = f"GW_BOUNDARY -> {owner}" if owner else "GW_BOUNDARY"
             (tw, th), _ = cv2.getTextSize(label, _FONT, 0.8, 2)
             tx, ty = max(0, (w - tw) // 2), th + 16
             cv2.rectangle(frame, (tx - 8, ty - th - 8), (tx + tw + 8, ty + 8),
@@ -134,10 +137,17 @@ def draw_gap_overlays(
         if bbox is not None:
             x1, y1, x2, y2 = [int(v) for v in bbox]
             cv2.rectangle(frame, (x1, y1), (x2, y2), GAP_COLOR, 2)
+            # OWNERSHIP DIVIDER: vertical line at the gap centre_x -- the moving
+            # image split.  The wagon on the majority side owns the whole frame,
+            # named in the "Owner" tag; the frame is never shared between wagons.
+            cxg = (x1 + x2) // 2
+            cv2.line(frame, (cxg, 0), (cxg, h - 1), (255, 255, 255), 1, cv2.LINE_AA)
             conf = float(g.get("confidence") or 0.0)
             lines = [f"Gap #{g.get('_num', '?')}",
                      f"Track {g.get('track_id')}",
                      f"Conf: {conf:.2f}"]
+            if owner:
+                lines.append(f"Owner: {owner}")
             ly = max(0, y1 - 6 - 18 * (len(lines) - 1))
             for ln in lines:
                 cv2.putText(frame, ln, (x1, ly), _FONT, 0.55, GAP_COLOR, 2, cv2.LINE_AA)

@@ -454,7 +454,8 @@ def _render_one_camera(
 
         # Stage-1 gaps LAST so they overlay (never replace) the feature boxes.
         gap_overlay.draw_gap_overlays(frame, frame_idx, gap_by_frame, gap_boundary_frames,
-                                      all_gaps=gaps_numbered, show_counter=True)
+                                      all_gaps=gaps_numbered, show_counter=True,
+                                      owner=cur_wagon.global_id if cur_wagon else None)
 
         writer.write(frame)
         written += 1

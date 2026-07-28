@@ -342,6 +342,47 @@ def fuse_master_timeline(
 
 
 # -----------------------------------------------------------------------------
+# Ownership-based boundary assignment
+# -----------------------------------------------------------------------------
+
+def ownership_transition_frame(gap: GapEvent, frame_width: int) -> Optional[int]:
+    """OWNERSHIP transition between the wagon before this gap and the wagon after.
+
+    A gap is visible over a RANGE of frames as it sweeps across the image.  The
+    boundary between the two wagons is NOT the gap's temporal centre -- it is the
+    frame at which image ownership flips, i.e. where the gap's image-plane centre
+    crosses the frame MIDLINE so that the majority of the visible image goes from
+    the previous wagon to the next.  Combines both cues the caller asked for:
+
+      * spatial  -- the gap's centre_x vs the image midline (majority owner);
+      * temporal -- the train's travel direction (sign of the centre_x drift),
+                    used to pick the crossing consistent with that direction.
+
+    Uses the gap's per-hit trajectory (``hit_frames`` + ``bbox_history``).
+    Returns ``None`` when the gap never crosses the midline (caller keeps the
+    gap's temporal centre).  Frames strictly BEFORE the returned frame belong to
+    the previous wagon, frames from it ONWARD to the next -- every frame is owned
+    by exactly one wagon; none is shared or discarded.
+    """
+    hf = getattr(gap, "hit_frames", None)
+    bh = getattr(gap, "bbox_history", None)
+    if not hf or not bh or frame_width <= 0 or len(hf) != len(bh):
+        return None
+    mid = frame_width / 2.0
+    cx = [(float(b[0]) + float(b[2])) / 2.0 for b in bh]
+    direction = 1.0 if cx[-1] >= cx[0] else -1.0     # travel direction across image
+    for i in range(len(cx) - 1):
+        a, b = cx[i], cx[i + 1]
+        if a == mid:
+            return int(hf[i])
+        if (a - mid) * (b - mid) < 0 and (b - a) * direction >= 0:
+            denom = (b - a)
+            t = (mid - a) / denom if denom != 0 else 0.0
+            return int(round(hf[i] + t * (hf[i + 1] - hf[i])))
+    return None
+
+
+# -----------------------------------------------------------------------------
 # Step E -- rebuild GlobalWagons, inheriting RIGHT_UP classification
 # -----------------------------------------------------------------------------
 
@@ -353,16 +394,39 @@ def build_global_wagons(
     initial_classifications: List[_MasterClassification],
     support_camera_ids: List[str],
     master_camera_id: str = MASTER_CAMERA,
+    frame_width: int = 0,
 ) -> List[GlobalWagon]:
     if master_total_frames <= 0:
         return []
 
+    # Split adjacent wagons at the OWNERSHIP-TRANSITION frame (image-majority
+    # flip) rather than the gap's temporal centre; fall back to the centre when
+    # the gap never crosses the midline.  Each boundary is clamped to stay
+    # strictly between its neighbours, so there is exactly ONE boundary per gap
+    # and the wagon COUNT + ordering are preserved (only WHERE the split lands
+    # changes).  Every frame lands in exactly one contiguous [start, end] span.
+    ordered = sorted(fused_gaps, key=lambda g: g.center_frame)
+    n_ord = len(ordered)
     boundaries: List[int] = []
-    for g in fused_gaps:
-        f = int(round(g.center_frame))
+    prev_b = 0
+    n_ownership = 0
+    for i, g in enumerate(ordered):
+        center = int(round(g.center_frame))
+        of = ownership_transition_frame(g, frame_width)
+        if of is not None:
+            n_ownership += 1
+        f = of if of is not None else center
+        nxt_center = (int(round(ordered[i + 1].center_frame))
+                      if i + 1 < n_ord else master_total_frames)
+        lo, hi = prev_b + 1, nxt_center - 1
+        f = max(lo, min(hi, f)) if lo <= hi else center
         f = max(0, min(master_total_frames - 1, f))
         boundaries.append(f)
-    boundaries.sort()
+        prev_b = f
+    if frame_width > 0 and n_ord:
+        print(f"[STAGE1] Ownership boundaries: {n_ownership}/{n_ord} split at the "
+              f"image-majority crossing (rest kept the gap centre); every frame "
+              f"belongs to exactly one wagon")
 
     def label_for_frame(frame_idx: int) -> Tuple[str, float]:
         for c in initial_classifications:
@@ -482,6 +546,7 @@ def build_wagons_pure_master(
         initial_classifications=initial_classifications,
         support_camera_ids=[master_tracks.camera_id],
         master_camera_id=master_tracks.camera_id,
+        frame_width=master_tracks.width,
     )
 
 
@@ -714,6 +779,7 @@ def assemble_global_train_state(
             initial_classifications=initial_classifications,
             support_camera_ids=[st.camera_id for st in support_tracks],
             master_camera_id=master_id,
+            frame_width=master_tracks.width,
         )
     except Exception as e:
         fallback_used = True

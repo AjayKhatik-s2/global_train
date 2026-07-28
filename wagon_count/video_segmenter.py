@@ -279,9 +279,17 @@ def render_processed_video(
             if interp_bbox is not None:
                 x1, y1, x2, y2 = [int(v) for v in interp_bbox]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), _TRACKED_GAP_COLOR, 2)
-                # Gap # (running order) + stable Track id + confidence
+                # OWNERSHIP DIVIDER: vertical line at the gap centre_x.  The wagon
+                # on the majority side owns the whole frame -- named in "Owner"
+                # below -- so the split between adjacent wagons is visible and
+                # each frame clearly belongs to exactly one wagon.
+                cxg = (x1 + x2) // 2
+                cv2.line(frame, (cxg, 0), (cxg, frame.shape[0] - 1),
+                         (255, 255, 255), 1, cv2.LINE_AA)
+                owner = frame_to_wagon.get(frame_idx)
                 cv2.putText(frame, f"Gap #{gap_num.get(id(active_gap), '?')} "
-                                   f"Track {active_gap.track_id}",
+                                   f"Track {active_gap.track_id}"
+                                   + (f" Owner {owner.global_id}" if owner else ""),
                             (x1, max(0, y1 - 24)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, _TRACKED_GAP_COLOR, 2, cv2.LINE_AA)
                 cv2.putText(frame, f"Conf: {active_gap.confidence:.2f}",

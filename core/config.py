@@ -82,6 +82,14 @@ RECON_MODELS_DIR = _env_path("WAGONEYE_RECON_MODELS_DIR",
 FEAT_MODELS_DIR  = _env_path("WAGONEYE_FEAT_MODELS_DIR",
                              os.path.join(MODELS_DIR, "features"))
 
+# EXTRACTION classify models (empty_track / wagon / engine / second_track) used by
+# the raw->trimmed producer.  Deliberately a SEPARATE tree from
+# RECON_MODELS_DIR: `side_classification.pt` exists in both and they are DIFFERENT
+# models (extraction classifier vs Stage-1 segment classifier), so a shared dir
+# would silently collide.  Kept in sync with train_extraction.driver's default.
+EXTRACTION_MODELS_DIR = _env_path("WAGONEYE_EXTRACTION_MODELS_DIR",
+                                  os.path.join(MODELS_DIR, "extraction"))
+
 WORKSPACE_ROOT   = _env_path("WAGONEYE_WORKSPACE_ROOT",
                              os.path.join(PROJECT_ROOT, "batch_outputs"))
 LOCAL_INPUTS_DIR = _env_path("WAGONEYE_LOCAL_INPUTS_DIR",
@@ -226,6 +234,18 @@ EXTRACTION_POLL_INTERVAL = int(_env_float("WAGONEYE_EXTRACTION_POLL_INTERVAL", 6
 
 
 # -----------------------------------------------------------------------------
+# OCR engine -- 'rekognition' (default, AWS DetectText; V4 parity) | 'easyocr'
+# (local, no network).  Resolved here so the startup summary + validation can
+# report it; features/ocr/processor.resolve_engine() is the runtime authority and
+# reads the same variable.
+# -----------------------------------------------------------------------------
+
+OCR_ENGINE = _env_str("WAGONEYE_OCR_ENGINE", "rekognition").strip().lower()
+if OCR_ENGINE not in ("rekognition", "easyocr"):
+    OCR_ENGINE = "rekognition"
+
+
+# -----------------------------------------------------------------------------
 # Startup configuration validation + redacted summary
 # -----------------------------------------------------------------------------
 
@@ -278,6 +298,38 @@ def validate_config(*, mode: str, skip_upload: bool = False,
             errors.append("email enabled but EMAIL_API_URL / EMAIL_RECEIVER missing "
                           "(or pass --skip-email)")
 
+    # ---- pipeline source = raw: this process produces its own trimmed clips ----
+    # Fail fast here instead of letting every per-camera sweep raise
+    # FileNotFoundError once a minute for the life of the service.
+    if PIPELINE_SOURCE.requires_extraction:
+        if not os.path.isdir(EXTRACTION_MODELS_DIR):
+            errors.append(
+                f"PIPELINE_SOURCE=raw but the extraction models dir does not "
+                f"exist: {EXTRACTION_MODELS_DIR} (set "
+                f"WAGONEYE_EXTRACTION_MODELS_DIR, or use --source trimmed)")
+        else:
+            missing = [f for f in C.EXTRACTION_MODEL_FILES
+                       if not os.path.isfile(os.path.join(EXTRACTION_MODELS_DIR, f))]
+            if missing:
+                errors.append(
+                    f"PIPELINE_SOURCE=raw but extraction classify model(s) "
+                    f"missing from {EXTRACTION_MODELS_DIR}: {', '.join(missing)}. "
+                    f"These are the EXTRACTION classifiers (empty_track/wagon/"
+                    f"engine), NOT the Stage-1 reconstruction models.")
+        if EXTRACTION_POLL_INTERVAL <= 0:
+            errors.append("WAGONEYE_EXTRACTION_POLL_INTERVAL must be > 0")
+
+    # ---- OCR engine ----
+    # Rekognition is the default engine; it needs boto3 + a region.  A missing
+    # dependency is reported at startup rather than degrading silently per wagon.
+    if mode in ("auto", "once", "batch") and OCR_ENGINE == "rekognition":
+        try:
+            import boto3  # noqa: F401
+        except ImportError:
+            errors.append(
+                "WAGONEYE_OCR_ENGINE=rekognition (default) requires boto3 "
+                "(pip install boto3), or set WAGONEYE_OCR_ENGINE=easyocr")
+
     # writable dirs
     import tempfile as _tf
     for name, d in (("WORKSPACE_ROOT", WORKSPACE_ROOT), ("LOG_DIR", LOG_DIR),
@@ -303,6 +355,8 @@ def startup_summary(*, mode: str) -> str:
         f"  device                   : {resolve_device()}",
         f"  workspace                : {WORKSPACE_ROOT}",
         f"  log_dir                  : {LOG_DIR}",
+        f"  extraction_models_dir    : {EXTRACTION_MODELS_DIR}"
+        + ("" if PIPELINE_SOURCE.requires_extraction else "  (unused: source=trimmed)"),
         f"  master_wait_min          : {MASTER_WAIT_MINUTES}",
         f"  support_fusion_wait_min  : {SUPPORT_FUSION_WAIT_MINUTES}",
         f"  final_camera_wait_min    : {FINAL_CAMERA_WAIT_MINUTES}",
@@ -312,6 +366,7 @@ def startup_summary(*, mode: str) -> str:
         f"  email_interim_reports    : {EMAIL_INTERIM_REPORTS}",
         f"  late_camera_policy       : {LATE_CAMERA_POLICY}",
         f"  pipeline_source          : {PIPELINE_SOURCE.value}",
+        f"  ocr_engine               : {OCR_ENGINE}",
         f"  poll_interval_s          : {ACTIVE_BATCH_POLL_INTERVAL}",
         f"  s3_output_bucket         : {C.S3_OUTPUT_BUCKET}",
         f"  s3_input_bucket          : {C.S3_INPUT_BUCKET}",

@@ -223,20 +223,20 @@ def test_lifecycle_late_camera_and_ordering_and_skip():
     restore = _patch_recording(calls)
     try:
         # late LEFT_UP -> ONLY door(left); no ocr/load/damage
-        LR._run_camera_features(m, ctx, cameras=[C.CAMERA_LEFT_UP], state=st,
+        LR._run_wagon_features(m, ctx, cameras=[C.CAMERA_LEFT_UP], state=st,
                                 cache_root=cache, states_root=states, evidence_root=ev)
         assert calls == [("door", (C.CAMERA_LEFT_UP,))], calls
 
         # top camera -> load BEFORE damage (deterministic ordering)
         calls.clear()
-        LR._run_camera_features(m, ctx, cameras=[C.CAMERA_RIGHT_UP_TOP], state=st,
+        LR._run_wagon_features(m, ctx, cameras=[C.CAMERA_RIGHT_UP_TOP], state=st,
                                 cache_root=cache, states_root=states, evidence_root=ev)
         assert calls == [("load", (C.CAMERA_RIGHT_UP_TOP,)),
                          ("damage", (C.CAMERA_RIGHT_UP_TOP,))], calls
 
         # re-run (restart) -> markers skip everything
         calls.clear()
-        LR._run_camera_features(m, ctx, cameras=[C.CAMERA_LEFT_UP, C.CAMERA_RIGHT_UP_TOP],
+        LR._run_wagon_features(m, ctx, cameras=[C.CAMERA_LEFT_UP, C.CAMERA_RIGHT_UP_TOP],
                                 state=st, cache_root=cache, states_root=states,
                                 evidence_root=ev)
         assert calls == [], calls

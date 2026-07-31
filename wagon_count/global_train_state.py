@@ -313,6 +313,14 @@ class GlobalTrainState:
     fallback_used: bool = False
     fallback_reason: str = ""
 
+    # Travel direction of the rake across the master camera's image plane:
+    # 'left-to-right' | 'right-to-left' | 'unknown'  (same vocabulary the V4
+    # Train-Inspection-Engine's optical-flow detector emits, so the per-camera
+    # inspection JSON reports it identically).  Derived from the sign of the gap
+    # tracks' centre_x drift -- data the tracker already produced, so this costs
+    # nothing extra and needs no video re-read.
+    travel_direction: str = "unknown"
+
     # ---- Master-first incremental reconstruction provenance (v4 lifecycle) ----
     # Which cameras actually participated when this state was SEALED, and which
     # were missing at that moment.  A late camera enriches features later but
@@ -368,6 +376,7 @@ class GlobalTrainState:
             "corrections_applied": [c.to_dict() for c in self.corrections_applied],
             "fallback_used": self.fallback_used,
             "fallback_reason": self.fallback_reason,
+            "travel_direction": self.travel_direction,
             "participating_cameras": list(self.participating_cameras),
             "missing_at_reconstruction": list(self.missing_at_reconstruction),
             "reconstruction_mode": self.reconstruction_mode,

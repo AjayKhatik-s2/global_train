@@ -49,6 +49,12 @@ class GlobalTrainState:
     fallback_used: bool = False
     fallback_reason: str = ""
 
+    # 'left-to-right' | 'right-to-left' | 'unknown' -- see
+    # wagon_count.global_alignment.travel_direction.  Consumed by the per-camera
+    # inspection JSON (`direction`, and the side-camera `rake_status` derived
+    # from it).  Absent in a pre-existing batch's JSON -> 'unknown'.
+    travel_direction: str = "unknown"
+
     # Master-first incremental reconstruction provenance (mirrors
     # wagon_count.global_train_state.GlobalTrainState; the JSON schema is the
     # contract between the two definitions).
@@ -114,6 +120,7 @@ def load_global_train_state(path: str) -> GlobalTrainState:
         corrections_applied=list(doc.get("corrections_applied") or []),
         fallback_used=bool(doc.get("fallback_used", False)),
         fallback_reason=doc.get("fallback_reason", "") or "",
+        travel_direction=doc.get("travel_direction", "unknown") or "unknown",
         participating_cameras=list(doc.get("participating_cameras") or []),
         missing_at_reconstruction=list(doc.get("missing_at_reconstruction") or []),
         reconstruction_mode=doc.get("reconstruction_mode", "") or "",

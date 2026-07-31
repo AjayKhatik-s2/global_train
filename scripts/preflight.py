@@ -93,13 +93,17 @@ def check_dirs(res: Result) -> None:
     from core import config as CFG
     import tempfile
     print(_hdr("\n[2/5] Runtime directories (exist + writable)"))
-    for name, d in (
+    dirs = [
         ("WORKSPACE_ROOT", CFG.WORKSPACE_ROOT), ("LOG_DIR", CFG.LOG_DIR),
         ("MODELS_DIR", CFG.MODELS_DIR),
         ("RECON_MODELS_DIR", CFG.RECON_MODELS_DIR),
         ("FEAT_MODELS_DIR", CFG.FEAT_MODELS_DIR),
         ("TMPDIR", tempfile.gettempdir()),
-    ):
+    ]
+    # Only relevant when this process produces its own trimmed clips.
+    if CFG.PIPELINE_SOURCE.requires_extraction:
+        dirs.append(("EXTRACTION_MODELS_DIR", CFG.EXTRACTION_MODELS_DIR))
+    for name, d in dirs:
         try:
             os.makedirs(d, exist_ok=True)
             res.check(os.access(d, os.W_OK), f"{name} ({d})",
@@ -194,6 +198,50 @@ def check_aws(res: Result) -> None:
     else:
         res.warn("model bucket unset (WAGONEYE_MODELS_S3_BUCKET)",
                  "auto model-sync disabled; models must be present locally")
+
+    # Rekognition DetectText -- the default OCR engine.  A 1x1 JPEG is the
+    # cheapest possible real call and proves both the IAM permission and that
+    # DetectText exists in this region.  InvalidImageFormatException also proves
+    # both (the request was authorized and reached the service), so it passes.
+    from core import config as CFG
+    if CFG.OCR_ENGINE != "rekognition":
+        print(f"  [{_ok('SKIP')}] Rekognition (WAGONEYE_OCR_ENGINE="
+              f"{CFG.OCR_ENGINE})")
+        return
+    from core.rekognition import REKOGNITION_REGION
+    try:
+        rek = boto3.client("rekognition", region_name=REKOGNITION_REGION)
+    except Exception as e:
+        res.check(False, f"Rekognition client ({REKOGNITION_REGION})", str(e))
+        return
+    tiny_jpeg = bytes.fromhex(
+        "ffd8ffe000104a46494600010100000100010000ffdb004300ffffffffffffffff"
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        "ffffffffffc00011080001000101011100ffc40014000100000000000000000000"
+        "0000000000ffda0008010100003f00d2cf20ffd9")
+    try:
+        rek.detect_text(Image={"Bytes": tiny_jpeg})
+        res.check(True, f"Rekognition DetectText ({REKOGNITION_REGION})")
+    except Exception as e:
+        code = ""
+        try:
+            code = e.response.get("Error", {}).get("Code", "")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        if code in ("InvalidImageFormatException", "InvalidParameterException",
+                    "ImageTooLargeException"):
+            # Reached + authorized the service; it just disliked the probe image.
+            res.check(True, f"Rekognition DetectText ({REKOGNITION_REGION})",
+                      f"reachable (probe rejected: {code})")
+        elif code in ("AccessDeniedException", "AccessDenied", "403"):
+            res.check(False, f"Rekognition DetectText ({REKOGNITION_REGION})",
+                      "IAM lacks rekognition:DetectText -- grant it, or set "
+                      "WAGONEYE_OCR_ENGINE=easyocr")
+        else:
+            res.check(False, f"Rekognition DetectText ({REKOGNITION_REGION})",
+                      f"{code or type(e).__name__}: {e}  (check the region "
+                      f"supports DetectText, or set WAGONEYE_OCR_ENGINE=easyocr)")
 
 
 def main(argv=None) -> int:

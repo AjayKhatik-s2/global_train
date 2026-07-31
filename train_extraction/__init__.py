@@ -11,4 +11,28 @@ all four cameras) and `run_extraction_service.py` (the continuous runner) are
 new.  See README.md for how it wires to the inspection pipeline.
 """
 
-from .driver import extract_trains, get_extractor, ALL_CAMERAS  # noqa: F401
+LAZY_EXPORTS = {
+    "extract_trains": ".driver",
+    "get_extractor": ".driver",
+    "ALL_CAMERAS": ".driver",
+}
+
+__all__ = list(LAZY_EXPORTS)
+
+
+def __getattr__(name):
+    """Resolve the driver exports ON FIRST USE (PEP 562).
+
+    `driver` pulls in boto3 + ultralytics, which only the PRODUCER path needs.
+    Importing them eagerly here meant that any consumer of a dependency-free
+    sibling -- notably `train_extraction.video_io.compress_video`, used by the
+    delivery stage to re-encode overlay videos -- would fail on a box without the
+    extraction dependencies.  Deferring keeps `from train_extraction import
+    extract_trains` working while letting `import train_extraction.video_io`
+    stand alone.
+    """
+    module_path = LAZY_EXPORTS.get(name)
+    if module_path is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+    return getattr(import_module(module_path, __name__), name)

@@ -19,6 +19,11 @@ from .url_utils import s3_object_url, split_bucket_prefix
 from .direction import detect_direction_zones
 from .segment_finder import TrainSegmentFinder
 
+# Seconds at the head of the NEXT raw clip that are scanned for a train, to decide
+# whether a held (incomplete) train continues into it.  Matches V4.
+_CONTINUATION_CHECK_SECONDS = int(
+    os.environ.get("WAGONEYE_EXTRACTION_CONTINUATION_CHECK_SECONDS", "10"))
+
 
 @dataclass
 class ExtractedTrain:
@@ -157,7 +162,12 @@ class TrainExtractor:
             "Ongoing train with %d prior clip(s) — checking continuation",
             len(self.ongoing_videos),
         )
-        if self.segment_finder.check_train_at_start(local_path, 5):
+        # 10 s continuation window -- matches the V4 Train-Inspection-Engine
+        # (`train_detection/extractor.py`).  A 5 s window was too short: a train
+        # entering slowly at the head of the next raw clip could be missed, which
+        # abandons the held leading part and loses that train.
+        if self.segment_finder.check_train_at_start(
+                local_path, _CONTINUATION_CHECK_SECONDS):
             self.logger.info("New clip continues the train — merging")
             self.ongoing_videos.append((local_path, video_key, basename))
 

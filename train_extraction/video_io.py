@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
-from typing import Sequence
+from typing import Optional, Sequence
 
 
 def _run_ffmpeg(cmd: Sequence[str], timeout: int, logger: logging.Logger) -> int:
@@ -23,6 +23,90 @@ def _run_ffmpeg(cmd: Sequence[str], timeout: int, logger: logging.Logger) -> int
     except FileNotFoundError:
         logger.error("ffmpeg not found in PATH")
         raise
+
+
+def compress_video(
+    input_path: str,
+    output_path: str,
+    logger: logging.Logger,
+    duration_sec: Optional[float] = None,
+    max_size_mb: float = 50.0,
+    crf: int = 26,
+) -> str:
+    """Re-encode ``input_path`` (e.g. a bulky mp4v-codec overlay video) to H.264,
+    GPU (NVENC) first then CPU (libx264) fallback.
+
+    Ported from the V4 Train-Inspection-Engine (`core/video_io.py`).
+
+    Uses a constant-quality encode (``crf``) so visual quality tracks the source.
+    If the result is still larger than ``max_size_mb``, re-encodes a second time
+    FROM THE ORIGINAL ``input_path`` (never from the first output, which would
+    compound generational loss) at a bitrate cap sized to fit under the limit.
+    The overlay video has no audio track, so the whole budget goes to video.
+    """
+    gpu_cmd = [
+        "ffmpeg", "-i", input_path,
+        "-c:v", "h264_nvenc", "-preset", "p1", "-cq", str(crf),
+        "-an", "-y", output_path,
+    ]
+    cpu_cmd = [
+        "ffmpeg", "-i", input_path,
+        "-c:v", "libx264", "-preset", "medium", "-crf", str(crf),
+        "-an", "-y", output_path,
+    ]
+
+    try:
+        rc = _run_ffmpeg(gpu_cmd, timeout=600, logger=logger)
+        if rc != 0:
+            logger.warning("GPU compress failed (rc=%s), falling back to CPU", rc)
+            rc = _run_ffmpeg(cpu_cmd, timeout=600, logger=logger)
+    except FileNotFoundError:
+        raise
+    except Exception as e:
+        logger.warning("GPU compress raised %s, falling back to CPU", e)
+        rc = _run_ffmpeg(cpu_cmd, timeout=600, logger=logger)
+
+    if rc != 0 or not os.path.exists(output_path):
+        raise RuntimeError(f"ffmpeg compress failed with code {rc}")
+
+    size_mb = os.path.getsize(output_path) / 1e6
+    logger.info("Compressed video: %.1f MB (crf=%d)", size_mb, crf)
+
+    if size_mb <= max_size_mb or not duration_sec or duration_sec <= 0:
+        return output_path
+
+    # Still too large -- re-encode from the ORIGINAL input at a bitrate cap sized
+    # to fit under max_size_mb (5% headroom for container overhead).
+    target_kbps = max(int((max_size_mb * 8192) / duration_sec * 0.95), 200)
+    logger.warning(
+        "Compressed video still %.1f MB > %.1f MB cap -- re-encoding at ~%dkbps",
+        size_mb, max_size_mb, target_kbps,
+    )
+    rate_args = [
+        "-b:v", f"{target_kbps}k", "-maxrate", f"{target_kbps}k",
+        "-bufsize", f"{target_kbps * 2}k",
+    ]
+    capped_gpu_cmd = (["ffmpeg", "-i", input_path,
+                       "-c:v", "h264_nvenc", "-preset", "p1"]
+                      + rate_args + ["-an", "-y", output_path])
+    capped_cpu_cmd = (["ffmpeg", "-i", input_path,
+                       "-c:v", "libx264", "-preset", "medium"]
+                      + rate_args + ["-an", "-y", output_path])
+    try:
+        rc = _run_ffmpeg(capped_gpu_cmd, timeout=600, logger=logger)
+        if rc != 0:
+            rc = _run_ffmpeg(capped_cpu_cmd, timeout=600, logger=logger)
+    except FileNotFoundError:
+        raise
+    except Exception as e:
+        logger.warning("GPU capped compress raised %s, falling back to CPU", e)
+        rc = _run_ffmpeg(capped_cpu_cmd, timeout=600, logger=logger)
+
+    if rc != 0 or not os.path.exists(output_path):
+        raise RuntimeError(f"ffmpeg bitrate-capped compress failed with code {rc}")
+    logger.info("Bitrate-capped video: %.1f MB",
+                os.path.getsize(output_path) / 1e6)
+    return output_path
 
 
 def trim_video(

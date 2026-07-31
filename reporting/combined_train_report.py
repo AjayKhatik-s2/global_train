@@ -57,6 +57,9 @@ def _build_json(
         "summary": summarize_wagons(wagons),
         "master_camera": state.master_camera,
         "total_wagons": state.total_wagons,
+        # Travel direction of the rake (Stage-1 derived).  Consumed by the
+        # per-camera inspection JSON's `direction` + side `rake_status`.
+        "travel_direction": getattr(state, "travel_direction", "unknown"),
         "source_video_urls": dict(source_video_urls or {}),
         "processed_video_urls": dict(processed_video_urls or {}),
         "cameras": {cam: payloads.get(cam, {}) for cam in C.ALL_CAMERAS},

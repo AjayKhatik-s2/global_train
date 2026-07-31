@@ -92,21 +92,16 @@ wagon_eye_v4/
 │   └── feature_overlay_renderer.py    Stage 4b (visualization-only;
 │                                       never reruns any detector)
 ├── reporting/
-│   ├── _brand.py                      Legacy WagonEye palette, paragraph
-│   │                                   styles, anomaly + state helpers,
-│   │                                   page widgets (logo, warning banner,
-│   │                                   camera links).
-│   ├── _adapter.py                    v4 backend -> legacy report view-
-│   │                                   model (merged_wagons + per-camera
-│   │                                   doors + KPIs).
+│   ├── _legacy_data_adapter.py        Global Train state -> the per-camera
+│   │                                   dicts the unmodified OLD production
+│   │                                   report generators consume.
+│   ├── combined_report_generator.py   The old production combined-PDF
+│   │                                   generator, vendored unmodified.
+│   ├── report_generator.py            The old per-camera PDF generator.
+│   ├── damage_report_generator.py     The old damaged-wagon PDF section.
 │   ├── _evidence_lookup.py            Quartile + midpoint cache frame
 │   │                                   resolution + evidence snapshot
 │   │                                   path helpers.
-│   ├── _pages.py                      Shared reportlab page widgets
-│   │                                   (doc maker, bordered image,
-│   │                                   detection-summary table, wagon
-│   │                                   quartile overview, detail page,
-│   │                                   simple-state page).
 │   ├── camera_reports.py              Stage 5a (4 camera-wise PDFs by
 │   │                                   camera authority: RIGHT_UP /
 │   │                                   LEFT_UP / RIGHT_UP_TOP /
@@ -121,19 +116,30 @@ wagon_eye_v4/
 │                                       legacy product).
 ├── delivery/
 │   ├── s3_upload.py                   Stage 6: PDF/JSON + tree upload
-│   └── notification.py                Stage 6: one email per batch
+│   ├── notification.py                Stage 6: one email per batch
+│   ├── inspection_json.py             Stage 6: EXACT V4 per-camera
+│   │                                   inspection_data.json (side + top)
+│   └── dashboard_ingest.py            Stage 6: upload + POST that feed
 ├── core/
 │   ├── constants.py                   camera ids, classes, statuses
+│   ├── rekognition.py                 AWS Rekognition client (OCR)
 │   ├── unified_wagon_state.py         UnifiedWagonState dataclass
 │   ├── global_state_loader.py         GlobalTrainState (in-memory)
 │   └── batch.py                       CameraVideo / TrainBatch
+├── train_extraction/                  raw CCTV -> trimmed train clips
+│                                       (producer; --source raw)
 ├── models/
-│   ├── reconstruction/                drop your 4 Stage-1 .pt files
-│   │                                   (right_up_gap.pt, left_up_gap.pt,
-│   │                                    top_gap.pt, side_classification.pt)
-│   └── features/                      drop your 4 Stage-3 .pt files
-│                                       (door_state.pt, loaded.pt,
-│                                        damage.pt, wagon_id_counting.pt)
+│   ├── reconstruction/                Stage-1 .pt files (right_up_gap.pt,
+│   │                                   left_up_gap.pt, top_gap.pt,
+│   │                                   side_classification.pt,
+│   │                                   top_classification.pt)
+│   ├── features/                      Stage-3 .pt files (door_state.pt,
+│   │                                   loaded.pt, damage.pt,
+│   │                                   wagon_number_update.pt)
+│   └── extraction/                    EXTRACTION classifiers, --source raw
+│                                       only (side_classification.pt +
+│                                       top_classification.pt -- DIFFERENT
+│                                       weights from reconstruction/)
 └── wagon_count/                       Phase-1 backend (copied verbatim
                                        + short-name alias shim)
 ```
@@ -188,6 +194,15 @@ batch_outputs/<batch_key>/
 ```
 
 ## Deployment
+
+**Running the whole thing as one auto pipeline** (raw CCTV → extract → inspect →
+report → dashboard, one systemd service): see
+**[AUTOPIPELINE.md](AUTOPIPELINE.md)** — buckets, models, IAM, env file, the
+Rekognition OCR path, and the per-camera inspection JSON.
+
+```bash
+python -m orchestrator.master_runner --auto --source raw --no-interactive
+```
 
 For a production **EC2** install (one-command setup script, systemd service,
 continuous S3 polling, monitoring, reboot-safe restart), see
@@ -257,6 +272,16 @@ path — `PROJECT_ROOT` is auto-detected from the source tree.
 | `WAGONEYE_EMAIL_API_URL`     | *(prod URL)*                  | Email microservice endpoint. |
 | `WAGONEYE_EMAIL_RECEIVER`    | *(prod list)*                 | Comma-sep TO recipients. |
 | `WAGONEYE_EMAIL_RECEIVER_CC` | *(prod list)*                 | Comma-sep CC recipients. |
+| `WAGONEYE_PIPELINE_SOURCE`   | `trimmed`                     | `raw` = also run train extraction in-process. |
+| `WAGONEYE_EXTRACTION_MODELS_DIR` | `<models>/extraction`     | Extraction classifiers (`raw` only). |
+| `WAGONEYE_OCR_ENGINE`        | `rekognition`                 | `rekognition` (AWS DetectText, V4 parity) or `easyocr`. |
+| `WAGONEYE_REKOGNITION_REGION`| = `WAGONEYE_S3_REGION`        | Region for DetectText. |
+| `WAGONEYE_REKOGNITION_MAX_CALLS_PER_WAGON` | `4`             | Hard per-wagon DetectText budget. |
+| `WAGONEYE_OCR_GAP_TOLERANCE` | `8`                           | Frame gap separating two plate bands. |
+| `WAGONEYE_DASHBOARD_INGEST_ENABLED` | `true`                 | Emit + POST the per-camera inspection JSON. |
+| `WAGONEYE_INSPECTION_VERSION`| `v1`                          | `version` in the document — the dashboard picks its tab from this. |
+
+Full annotated reference: [deploy/wagon-eye.env.example](deploy/wagon-eye.env.example).
 
 AWS credentials use boto3's default chain — an **EC2 IAM instance role** is
 picked up automatically; no keys in the repo.

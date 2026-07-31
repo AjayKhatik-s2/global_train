@@ -32,22 +32,39 @@ Hard guarantees (by construction)
   generated JSON's sha256 + report revision) is persisted; an already-ingested
   camera is skipped on re-entry -- no duplicate uploads, no duplicate ingest.
 
-Degraded fields (documented, never invented)
---------------------------------------------
-* ``direction``            -> "unknown" (optical-flow direction is not in any
-                              finalized artifact; recompute is out of scope for a
-                              read-only adapter).
-* ``rake_status``          -> derived from FUSED load results (Loaded/Empty),
-                              a measured proxy for the old direction heuristic.
+Schema
+------
+The document is the EXACT V4 schema -- see `delivery/inspection_json.py`, a
+faithful port of the V4 engine's ``reporting/json_builder.py`` (both flavours,
+same keys, same key order, same derivations).  Per-camera authority is respected,
+so the four files genuinely differ: RIGHT_UP reports the right door + OCR, LEFT_UP
+the left door, and each top camera its own load + damage reads.
+
+Fields whose V4 source does not exist in this pipeline (documented, never invented)
+----------------------------------------------------------------------------------
 * ``loco_frames`` /
   ``loco_number_results`` /
-  ``total_loco_frames``    -> empty (v4 has no loco-specific frame/OCR feed).
-* ``wagon_frames`` gallery -> synthesized from whatever per-camera evidence JPEGs
-                              exist; only files that are actually present are
+  ``total_loco_frames``    -> empty.  global_train has no loco-specific frame or
+                              5-digit loco-OCR feed; V4's side flavour populates
+                              these from a dedicated loco band pass.
+* ``floor_dmg_probable``   -> always False on top cameras: the current
+                              ``damage.pt`` has no "probable" class (V4's
+                              ``V4_top_damage`` does).  Reported, never guessed.
+* ``wagon_frames`` gallery -> assembled from whatever per-camera evidence JPEGs
+                              exist, named with V4's start/mid1/mid2/end
+                              positions; only files actually on disk are
                               referenced (never fabricated).
+* ``s3_key`` on problem
+  frames                   -> null; this adapter references the already-uploaded
+                              ``train_batch/.../evidence/...`` URL rather than
+                              re-uploading into the legacy key layout.
 
-The degraded set for each payload is echoed under ``inspection_data._adapter`` so
-a consumer can see exactly what was and was not faithfully reproduced.
+``direction`` is NO LONGER degraded: Stage 1 now derives the rake's travel
+direction from the master camera's gap trajectories and persists it, so
+``direction`` and the side-camera ``rake_status`` derived from it match V4's
+vocabulary (see `wagon_count.global_alignment.travel_direction`).
+
+Provenance for each payload is echoed under ``inspection_data._adapter``.
 
 NOTE: this posts to the LIVE dashboard on every run.  Confirm with the dashboard
 team that (a) reused ``train_batch/.../evidence/...`` HTTPS URLs are accepted and
@@ -113,23 +130,36 @@ def _env_json_map(name: str, default: Dict[str, str]) -> Dict[str, str]:
     return dict(default)
 
 
-# Full CCTV camera ids (dashboard primary key).  Defaults taken from the old
-# per-camera run_service.py INPUT_BUCKET suffixes.
-_DEFAULT_FULL_IDS = {
-    C.CAMERA_RIGHT_UP:     "camera_CCTV_HZBN_DHN_2_RIGHT_UP",
-    C.CAMERA_LEFT_UP:      "camera_CCTV_HZBN_DHN_1_LEFT_UP",
-    C.CAMERA_RIGHT_UP_TOP: "camera_CCTV_HZBN_DHN_5_RIGHT_TOP",
-    C.CAMERA_LEFT_UP_TOP:  "camera_CCTV_HZBN_DHN_6_LEFT_TOP",
-}
+# Full CCTV camera ids (dashboard primary key) == the V4 `camera_id`, resolved
+# from the shared registry in core.constants so the extraction buckets, the
+# report layout, and this feed can never disagree about a camera's folder name.
+_DEFAULT_FULL_IDS = dict(C.CAMERA_S3_FOLDER)
 
-# Legacy dashboard S3 folder (prefix) per camera.  RIGHT_UP="Right_up" is the
-# only one confirmed from the old env; the others follow the same convention and
-# MUST be confirmed with the dashboard team before enabling.
+# Dashboard S3 folder (prefix) per camera, inside WAGONEYE_INSPECTION_JSON_BUCKET.
+#
+# VERIFIED, not assumed.  Each value is the `INSPECTION_JSON_FOLDER` constant from
+# that camera's own old per-camera production pipeline
+# (`output_test/<CAMERA>/sagemaker_main.py`), which is the process that has been
+# populating this dashboard.  Note the two TOP cameras do NOT follow the
+# "<side>_up_top" pattern -- they are `Right_Top` / `Left_Top`, with a capital T
+# and no "up".  An earlier version of this module guessed `Right_up_top` /
+# `Left_up_top`, which would have published both top cameras into folders the
+# dashboard never reads.
+#
+#   camera        old pipeline constant        folder
+#   RIGHT_UP      INSPECTION_JSON_FOLDER  ->   Right_up
+#   LEFT_UP       INSPECTION_JSON_FOLDER  ->   Left_up
+#   RIGHT_UP_TOP  INSPECTION_JSON_FOLDER  ->   Right_Top
+#   LEFT_UP_TOP   INSPECTION_JSON_FOLDER  ->   Left_Top
+#
+# Full key: <folder>/<YYYY-MM-DD>/<raw_basename>_inspection.json, where the date
+# uses the 05:00 IST operational-day boundary (see `date_folder`) -- identical to
+# the old pipeline's `_train_date_folder`.
 _DEFAULT_FOLDERS = {
     C.CAMERA_RIGHT_UP:     "Right_up",
     C.CAMERA_LEFT_UP:      "Left_up",
-    C.CAMERA_RIGHT_UP_TOP: "Right_up_top",
-    C.CAMERA_LEFT_UP_TOP:  "Left_up_top",
+    C.CAMERA_RIGHT_UP_TOP: "Right_Top",
+    C.CAMERA_LEFT_UP_TOP:  "Left_Top",
 }
 
 
@@ -144,12 +174,55 @@ def _inspection_bucket() -> str:
     return _env("WAGONEYE_INSPECTION_JSON_BUCKET", "ankit-version-1-prod")
 
 
+#: The V1 dashboard receiver -- the endpoint this feed has always posted to, and
+#: the default.  Kept as the default so an upgrade never silently repoints live
+#: production traffic at a different backend.
+INGEST_URL_V1 = ("https://ms-pnr-location-notification-api.suvidhaen.com/"
+                 "cctv-receiver/inspections/ingest")
+
+#: The V4 Train-Inspection-Engine's receivers (core/config.py:
+#: receiver_json_ingest_api_url_{prod,uat}).  V4 posts each document to BOTH.
+#: A DIFFERENT HOST from INGEST_URL_V1 -- a report delivered to one is not
+#: visible on the other.
+INGEST_URL_V4_PROD = "https://cctv-wagon-api.suvidhaen.com/inspections/ingest"
+INGEST_URL_V4_UAT = "https://cctv-wagon-uat-api.suvidhaen.com/inspections/ingest"
+
+
 def _ingest_api_url() -> str:
-    return _env(
-        "WAGONEYE_INSPECTION_INGEST_API_URL",
-        "https://ms-pnr-location-notification-api.suvidhaen.com/"
-        "cctv-receiver/inspections/ingest",
-    )
+    """The single primary ingest endpoint (back-compat accessor)."""
+    return _env("WAGONEYE_INSPECTION_INGEST_API_URL", INGEST_URL_V1)
+
+
+def _ingest_api_urls() -> List[str]:
+    """Every endpoint this run posts each document to, in order.
+
+    Default: the V1 receiver only (unchanged live behaviour).
+
+    ``WAGONEYE_INSPECTION_INGEST_API_URLS`` takes a comma-separated list, so V4's
+    dual UAT+PROD delivery is a config change rather than a code change:
+
+        WAGONEYE_INSPECTION_INGEST_API_URLS=https://cctv-wagon-api.suvidhaen.com/inspections/ingest,https://cctv-wagon-uat-api.suvidhaen.com/inspections/ingest
+
+    The shorthand ``v4`` expands to both V4 receivers, and ``v1`` to the V1 one.
+    """
+    raw = os.getenv("WAGONEYE_INSPECTION_INGEST_API_URLS")
+    if not raw:
+        return [_ingest_api_url()]
+    urls: List[str] = []
+    for tok in raw.replace(";", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        low = tok.lower()
+        if low == "v4":
+            urls.extend([INGEST_URL_V4_PROD, INGEST_URL_V4_UAT])
+        elif low == "v1":
+            urls.append(INGEST_URL_V1)
+        else:
+            urls.append(tok)
+    # de-dup, preserving order
+    seen: set = set()
+    return [u for u in urls if not (u in seen or seen.add(u))]
 
 
 def _version() -> str:
@@ -301,228 +374,165 @@ class _UrlMaker:
 
 
 # -----------------------------------------------------------------------------
-# Per-camera legacy payload builder (PURE: no I/O beyond reading evidence)
+# Per-camera payload builder -- EXACT V4 schema
+#
+# The document itself is produced by `delivery.inspection_json`, which is a
+# faithful port of the V4 Train-Inspection-Engine's `reporting/json_builder.py`
+# (same two flavours, same keys, same key order, same derivations).  Everything
+# here is the ADAPTER around it: locate the finalized artifacts under
+# `batch_root`, decide this camera's URLs/timestamps, and hand them over.
 # -----------------------------------------------------------------------------
 
-# Ordered gallery candidates per camera role.
-_SIDE_GALLERY = ("door/{side}_best.jpg", "door/{side}_crop.jpg",
-                 "ocr/best_frame.jpg", "ocr/number_crop.jpg")
-_TOP_GALLERY = ("load/best_frame.jpg", "damage/track_1.jpg",
-                "damage/track_2.jpg", "damage/track_3.jpg")
-_POSITIONS = ("start", "mid1", "mid2", "end")
+def _strip_prefix_enabled() -> bool:
+    """Whether the document's ``camera_id`` drops the ``camera_`` prefix.
+
+    The default FOLLOWS THE VERSION, because the two must agree or the dashboard
+    cannot match the document to a camera:
+
+      * ``version=v4`` -> strip (``CCTV_HZBN_DHN_2_RIGHT_UP``).  This is what the
+        V4 engine's ``json_builder._strip_camera_prefix`` emits.
+      * ``version=v1`` (default) -> keep (``camera_CCTV_HZBN_DHN_2_RIGHT_UP``).
+        This is the identifier the existing V1 dashboard feed has always used, so
+        the live dashboard keeps resolving these reports.
+
+    Pinning ``WAGONEYE_INSPECTION_STRIP_CAMERA_PREFIX`` overrides the coupling in
+    either direction.
+    """
+    raw = os.getenv("WAGONEYE_INSPECTION_STRIP_CAMERA_PREFIX")
+    if raw is None or raw == "":
+        return _version().strip().lower() != "v1"
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-def build_inspection_json(*, camera: str, report_doc: Dict[str, Any],
-                          evidence_root: str, url_maker: "_UrlMaker") -> Dict[str, Any]:
-    """Build ONE legacy ``{camera_id, version, inspection_data}`` document for
-    `camera` from the finalized combined report + this camera's evidence.
+def _load_sealed_state(batch_root: str):
+    """The sealed GlobalTrainState -- the canonical wagon sequence all four
+    camera documents describe."""
+    from core.global_state_loader import load_global_train_state
+    return load_global_train_state(
+        os.path.join(batch_root, "global_state", "global_train_state.json"))
 
-    Pure w.r.t. the pipeline: reads only `report_doc` (already loaded) and files
-    under `evidence_root`.  Never invents image URLs or numbers."""
-    wagons = report_doc.get("wagons", []) or []
-    summary = report_doc.get("summary", {}) or {}
-    train_meta = report_doc.get("train_metadata", {}) or {}
+
+def _load_unified(batch_root: str, state) -> Dict[str, Any]:
+    """``{gw_id -> unified dict}`` from Stage-4 fusion (missing wagon -> {})."""
+    unified_dir = os.path.join(batch_root, "wagon_states", "unified")
+    out: Dict[str, Any] = {}
+    for gw in getattr(state, "wagons", []) or []:
+        p = os.path.join(unified_dir, f"{gw.global_id}.json")
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                out[gw.global_id] = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+    return out
+
+
+def build_inspection_json(*, camera: str, batch_root: str,
+                          report_doc: Dict[str, Any],
+                          url_maker: "_UrlMaker",
+                          state=None,
+                          unified: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Build ONE exact-V4 ``{camera_id, version, inspection_data}`` document.
+
+    Reads only finalized artifacts under `batch_root` (sealed GlobalTrainState,
+    fused unified states, this camera's own per-feature JSON, and its evidence
+    JPEGs) plus the already-loaded `report_doc` for train-level URLs.  Pure: no
+    model, no video, no writes.
+    """
+    from delivery import inspection_json as IJ
+
+    if state is None:
+        state = _load_sealed_state(batch_root)
+    if unified is None:
+        unified = _load_unified(batch_root, state)
+
+    evidence_root = os.path.join(batch_root, "evidence")
+    states_root = os.path.join(batch_root, "wagon_states")
+
     report_meta = report_doc.get("report_meta", {}) or {}
     batch_key = report_doc.get("batch_key", "")
-    source_urls = train_meta.get("source_video_urls", {}) or {}
-    processed_urls = train_meta.get("processed_video_urls", {}) or {}
+    source_urls = report_doc.get("source_video_urls", {}) or {}
+    processed_urls = report_doc.get("processed_video_urls", {}) or {}
 
-    side = _door_side(camera)
-    is_top = camera in C.TOP_CAMERAS
-
-    src_url = source_urls.get(camera, "")
-    raw_video_name = os.path.basename(src_url) if src_url else \
-        f"{batch_key}_{C.CAMERA_FOLDER.get(camera, camera)}.mp4"
+    src_url = source_urls.get(camera, "") or ""
+    raw_video_name = (os.path.basename(src_url) if src_url
+                      else f"{batch_key}_{C.CAMERA_FOLDER.get(camera, camera)}.mp4")
     ts = extract_train_timestamp(raw_video_name, batch_key)
-    upload_ts = (ts or datetime.now(_IST)).strftime("%Y-%m-%dT%H:%M:%S")
-    upload_ts_readable = (ts or datetime.now(_IST)).strftime("%d-%m-%Y %H:%M:%S") + " IST"
 
-    # Train-level counts.  total_wagons uses the GLOBAL fused count (authoritative
-    # across cameras); door/damage counts are scoped to THIS camera's authority.
-    total_wagons = int(summary.get("total_wagons", len(wagons)))
-    num_engines = int(summary.get("engine_count", 0))
-    loaded = int(summary.get("loaded", 0))
-    empty = int(summary.get("empty", 0))
-    if loaded == 0 and empty == 0:
-        rake_status = "Unknown"
-    else:
-        rake_status = "Loaded" if loaded >= empty else "Empty"
+    # Travel direction is Stage-1 derived (sign of the master's gap centre_x
+    # drift) and carried in the combined report; 'unknown' for a batch sealed
+    # before that field existed.
+    direction = (report_doc.get("travel_direction")
+                 or getattr(state, "travel_direction", "unknown") or "unknown")
 
-    doors_open = doors_closed = 0
-    if side:
-        state_key = f"{side}_door"
-        doors_open = sum(1 for w in wagons if w.get(state_key) == C.DOOR_OPEN)
-        doors_closed = sum(1 for w in wagons if w.get(state_key) == C.DOOR_CLOSED)
+    folder = full_camera_id(camera)
+    camera_folder = folder if _strip_prefix_enabled() else f"__keep__{folder}"
 
-    wagon_number_results: Dict[str, Any] = {}
-    segment_type_map: Dict[str, Any] = {}
-    wagon_segments: List[Dict[str, Any]] = []
-    problem_frames: List[Dict[str, Any]] = []
-    pf_type_counts: Dict[str, int] = {}
-    damaged_wagons: set = set()
+    def _url_for(*, gw_id: str, feature: str, camera: str,
+                 filename: str) -> Optional[str]:
+        return url_maker.url(evidence_root, gw_id, feature, camera, filename)
 
-    def _bump(t: str) -> None:
-        pf_type_counts[t] = pf_type_counts.get(t, 0) + 1
+    doc = IJ.build_inspection_json(
+        camera=camera,
+        camera_folder=folder,
+        raw_video_name=raw_video_name,
+        upload_timestamp=ts,
+        direction=direction,
+        state=state,
+        unified=unified,
+        states_root=states_root,
+        evidence_root=evidence_root,
+        url_for=_url_for,
+        trimmed_video_url=src_url,
+        pdf_report_url=_pdf_url(report_meta, camera),
+        detected_video_url=processed_urls.get(camera, "") or "",
+        raw_video_urls=[src_url] if src_url else [],
+        damage_model_active=_damage_model_active(report_doc),
+        version=_version(),
+        identified_by=_model_id(),
+        # Dialect follows the version: a v1 document must carry v1 shapes
+        # (bounding_box dict, "door_open", segment_number, v1 rake polarity) or
+        # the V1 dashboard cannot read it.  See inspection_json's module docs.
+        schema=IJ.schema_for_version(_version()),
+    )
+    if not _strip_prefix_enabled():
+        doc["camera_id"] = folder
 
-    for w in wagons:
-        gw = w.get("global_id", "")
-        idx = w.get("wagon_index", 0)
-        ident = w.get("wagon_identifier") or C.NO_DATA
-        digits = re.sub(r"[^0-9]", "", str(ident)) if ident != C.NO_DATA else ""
-        is_valid = len(digits) == C.WAGON_NUMBER_LENGTH
-        wagon_number_results[str(idx)] = {
-            "is_valid_11_digit": bool(is_valid),
-            "display_number": digits if digits else "-",
-        }
-        segment_type_map[str(idx)] = {"type": _seg_type(w.get("classification")),
-                                      "number": idx}
-
-        # ---- wagon gallery (synthesized from EXISTING evidence only) ----
-        templates = (_TOP_GALLERY if is_top
-                     else tuple(t.format(side=side) for t in _SIDE_GALLERY))
-        frames: List[Dict[str, Any]] = []
-        for rel in templates:
-            feat, fn = rel.split("/", 1)
-            u = url_maker.url(evidence_root, gw, feat, camera, fn)
-            if u:
-                frames.append({"position": _POSITIONS[min(len(frames), 3)],
-                               "s3_url": u})
-            if len(frames) >= 4:
-                break
-
-        door_status = "open" if (side and w.get(f"{side}_door") == C.DOOR_OPEN) \
-            else ("closed" if side else "N/A")
-        seg: Dict[str, Any] = {
-            "segment_id": idx,
-            "segment_type": _seg_type(w.get("classification")),
-            "wagon_count": idx,
-            "is_valid_wagon_id": bool(is_valid),
-            "door_status": door_status,
-            "damage_detected": False,
-            "wagon_frames": frames,
-        }
-        if is_valid:
-            seg["wagon_number"] = digits
-
-        # ---- problem frames scoped to this camera's authority ----
-        if side:
-            meta = _read_meta(evidence_root, gw, "door", camera)
-            side_meta = (meta.get("sides") or {}).get(side, {})
-            dstate = w.get(f"{side}_door")
-            if dstate == C.DOOR_OPEN:
-                _bump("door_open")
-                problem_frames.append(_problem_frame(
-                    idx=idx, gw=gw, camera=camera, evidence_root=evidence_root,
-                    url_maker=url_maker, feature="door", img=f"{side}_best.jpg",
-                    problem_type="door_open", class_name="door_open",
-                    bbox=side_meta.get("bbox"), conf=side_meta.get("confidence"),
-                    door_status="open", damage=False))
-            elif dstate == C.DOOR_DAMAGED:
-                _bump("side_damage")
-                damaged_wagons.add(idx)
-                seg["damage_detected"] = True
-                problem_frames.append(_problem_frame(
-                    idx=idx, gw=gw, camera=camera, evidence_root=evidence_root,
-                    url_maker=url_maker, feature="door", img=f"{side}_best.jpg",
-                    problem_type="side_damage", class_name="damage",
-                    bbox=side_meta.get("bbox"), conf=side_meta.get("confidence"),
-                    door_status="N/A", damage=True))
-
-        if is_top:
-            dmeta = _read_meta(evidence_root, gw, "damage", camera)
-            for tr in (dmeta.get("tracks") or []):
-                ti = tr.get("track_idx", 1)
-                cls = tr.get("class_name", "damage")
-                _bump(cls)
-                damaged_wagons.add(idx)
-                seg["damage_detected"] = True
-                problem_frames.append(_problem_frame(
-                    idx=idx, gw=gw, camera=camera, evidence_root=evidence_root,
-                    url_maker=url_maker, feature="damage", img=f"track_{ti}.jpg",
-                    problem_type=cls, class_name=cls,
-                    bbox=tr.get("bbox"),
-                    conf=tr.get("best_confidence", tr.get("confidence")),
-                    door_status="N/A", damage=True))
-
-        wagon_segments.append(seg)
-
-    if is_top:
-        damaged_count = len(damaged_wagons)
-    elif side:
-        damaged_count = len(damaged_wagons)
-    else:
-        damaged_count = 0
-
-    degraded = ["direction", "loco_frames", "loco_number_results",
-                "total_loco_frames"]
-    if not is_top and not side:
-        degraded.append("doors_open/doors_closed")
-
-    inspection_data = {
-        "raw_video_name": raw_video_name,
-        "identified_by": _model_id(),
-        "upload_timestamp": upload_ts,
-        "upload_timestamp_readable": upload_ts_readable,
-        "direction": "unknown",                       # DEGRADED (see module docstring)
-        "rake_status": rake_status,                   # DEGRADED: fused load proxy
-        "pdf_report_url": _pdf_url(report_meta, camera),
-        "trimmed_video_url": src_url,
-        "detected_video_url": processed_urls.get(camera, ""),
-        "raw_video_urls": [src_url] if src_url else [],
-        "total_wagons": total_wagons,
-        "doors_open": doors_open,
-        "doors_closed": doors_closed,
-        "damaged_wagons": damaged_count,
-        "num_engines": num_engines,
-        "total_loco_frames": 0,                       # DEGRADED: no loco feed in v4
-        "total_problem_frames": len(problem_frames),
-        "problem_frames_by_type": pf_type_counts,
-        "wagon_number_results": wagon_number_results,
-        "loco_number_results": {},                    # DEGRADED
-        "segment_type_map": segment_type_map,
-        "wagon_segments": wagon_segments,
-        "loco_frames": [],                            # DEGRADED
-        "problem_frames": problem_frames,
-        "_adapter": {
-            "generated_by": "wagon_eye_v4 delivery.dashboard_ingest",
-            "source": "combined_train_report.json",
-            "report_revision": report_meta.get("report_revision", 0),
-            "report_status": report_meta.get("report_status", ""),
-            "global_state_version":
-                report_meta.get("generated_from_global_state_version", ""),
-            "camera_authority": ("top:load+damage" if is_top
-                                 else (f"side:{side}_door+ocr" if side else "none")),
-            "degraded_fields": degraded,
-        },
+    # Provenance: which global_train run produced this document, and what this
+    # camera was authoritative for.  Additive -- never replaces a V4 field.
+    doc["inspection_data"]["_adapter"] = {
+        "generated_by": "global_train delivery.inspection_json (V4 schema)",
+        "source": "sealed global_train_state + fused unified + per-camera state",
+        "flavour": IJ.flavour_for(camera),
+        "report_revision": report_meta.get("report_revision", 0),
+        "report_status": report_meta.get("report_status", ""),
+        "global_state_version":
+            report_meta.get("generated_from_global_state_version", ""),
+        "camera_authority": _camera_authority(camera),
+        "direction_estimator": "stage1_gap_centre_x_drift",
     }
-    return {
-        "camera_id": full_camera_id(camera),
-        "version": _version(),
-        "inspection_data": inspection_data,
-    }
+    return doc
 
 
-def _problem_frame(*, idx, gw, camera, evidence_root, url_maker, feature, img,
-                   problem_type, class_name, bbox, conf, door_status, damage):
-    u = url_maker.url(evidence_root, gw, feature, camera, img)
-    coords = list(bbox)[:4] if isinstance(bbox, (list, tuple)) and len(bbox) >= 4 \
-        else [0, 0, 0, 0]
-    return {
-        "wagon_count": idx, "segment_type": "wagon", "segment_number": idx,
-        "problem_type": problem_type, "frame_number": 0,
-        "filename": f"{gw}_{camera}_{img}",
-        "s3_url": u,
-        "is_annotated": True,
-        "annotated_image_url": u,
-        "bounding_box": {
-            "bounding_box_coordinates": coords,
-            "confidence": round(float(conf), 3) if conf is not None else 0.0,
-            "class_name": class_name,
-        },
-        "door_status": door_status,
-        "door_close_detected": False,
-        "damage_detected": bool(damage),
-    }
+def _camera_authority(camera: str) -> str:
+    if camera == C.CAMERA_RIGHT_UP:
+        return "right_door+ocr+classification"
+    if camera == C.CAMERA_LEFT_UP:
+        return "left_door"
+    if camera == C.CAMERA_RIGHT_UP_TOP:
+        return "load(primary)+top_damage"
+    if camera == C.CAMERA_LEFT_UP_TOP:
+        return "load(fallback)+top_damage"
+    return "none"
+
+
+def _damage_model_active(report_doc: Dict[str, Any]) -> bool:
+    """False only when the damage feature was explicitly disabled for the run."""
+    for wagon in report_doc.get("wagons", []) or []:
+        if wagon.get("top_damage") == C.DISABLED_DISPLAY:
+            return False
+    return True
 
 
 def _pdf_url(report_meta: Dict[str, Any], camera: str) -> str:
@@ -675,7 +685,9 @@ def _run_inner(*, batch_root, s3_client, skip_upload, skip_ingest,
     output_bucket = C.S3_OUTPUT_BUCKET
     region = C.S3_REGION
     inspection_bucket = _inspection_bucket()
-    api_url = _ingest_api_url()
+    api_urls = _ingest_api_urls()
+    log.info("[DASHBOARD] ingest receivers (%d): %s", len(api_urls),
+             ", ".join(api_urls))
     reuse = _reuse_evidence_urls()
 
     batch_key = report_doc.get("batch_key", "")
@@ -684,6 +696,17 @@ def _run_inner(*, batch_root, s3_client, skip_upload, skip_ingest,
 
     prior = _load_status(batch_root)
 
+    # Load the sealed state + fused unified states ONCE and share them across all
+    # four camera documents, so every file describes the same wagon sequence with
+    # the same GW numbering (and we don't re-read N files per camera).
+    try:
+        shared_state = _load_sealed_state(batch_root)
+        shared_unified = _load_unified(batch_root, shared_state)
+    except Exception as e:
+        log.error("[DASHBOARD] cannot load sealed state -- nothing to ingest: %s", e)
+        result["error"] = f"no_global_state: {e}"
+        return result
+
     for camera in present:
         url_maker = _UrlMaker(
             s3_client=s3_client, output_bucket=output_bucket, region=region,
@@ -691,9 +714,11 @@ def _run_inner(*, batch_root, s3_client, skip_upload, skip_ingest,
             folder=folder_for(camera), date_folder_str=df,
             reuse=reuse, skip_upload=skip_upload)
         try:
-            doc = build_inspection_json(camera=camera, report_doc=report_doc,
-                                        evidence_root=evidence_root,
-                                        url_maker=url_maker)
+            doc = build_inspection_json(camera=camera, batch_root=batch_root,
+                                        report_doc=report_doc,
+                                        url_maker=url_maker,
+                                        state=shared_state,
+                                        unified=shared_unified)
         except Exception as e:
             log.error("[DASHBOARD] build failed for %s: %s", camera, e)
             result["cameras"][camera] = {"status": "build_failed", "error": str(e)}
@@ -758,17 +783,31 @@ def _run_inner(*, batch_root, s3_client, skip_upload, skip_ingest,
             result["cameras"][camera] = {"status": entry["status"], "dry_run": True}
             continue
 
+        # Same three fields the V4 engine sends (notifications.
+        # trigger_db_ingestion_dual): the payload's camera_id is ALWAYS the full
+        # prefixed folder, independent of the document's camera_id form.
         payload = {"camera_id": full_camera_id(camera),
                    "inspection_s3_uri": s3_uri, "version": _version()}
-        res = _post_ingest(api_url=api_url, payload=payload, idem_key=idem,
-                           requests_mod=requests_mod)
-        if res["ok"]:
-            entry["status"] = "ingested"
-            entry["run_id"] = res.get("run_id")
-        else:
-            entry["status"] = "ingest_failed"
-            entry["error"] = res.get("error")
-            entry["last_status_code"] = res.get("status_code")
+        # Post to every configured receiver (default: one).  A document counts as
+        # ingested when AT LEAST ONE accepts it; per-endpoint outcomes are all
+        # recorded so a partial delivery is visible rather than hidden.
+        per_endpoint: Dict[str, Any] = {}
+        any_ok = False
+        for url in api_urls:
+            res = _post_ingest(api_url=url, payload=payload, idem_key=idem,
+                               requests_mod=requests_mod)
+            per_endpoint[url] = {"ok": res["ok"],
+                                 "status_code": res.get("status_code"),
+                                 "run_id": res.get("run_id"),
+                                 "error": res.get("error")}
+            if res["ok"]:
+                any_ok = True
+                entry["run_id"] = entry.get("run_id") or res.get("run_id")
+            else:
+                entry["error"] = res.get("error")
+                entry["last_status_code"] = res.get("status_code")
+        entry["endpoints"] = per_endpoint
+        entry["status"] = "ingested" if any_ok else "ingest_failed"
         _record_status(batch_root, camera, entry)
         result["cameras"][camera] = {"status": entry["status"],
                                      "run_id": entry.get("run_id")}

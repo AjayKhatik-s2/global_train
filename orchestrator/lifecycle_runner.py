@@ -568,6 +568,13 @@ def stage_finalize(manifest: BatchManifest, ctx: RunContext) -> None:
                 h = FIN.sha256_file(mp4)
                 if h:
                     processed_video_hashes[cam] = h
+            # Mirror the overlay videos into V4's per-camera detected_video_bucket
+            # (the archive copy under train_batch/ is uploaded below regardless).
+            for cam, url in s3_upload.upload_detected_videos(
+                    ctx.s3_client,
+                    os.path.join(root, CFG.DIR_PROCESSED_VIDEOS),
+                    manifest.batch_key).items():
+                upload_urls[f"detected_{cam}"] = url
             for sub in (CFG.DIR_GLOBAL_STATE, CFG.DIR_WAGON_STATES, CFG.DIR_REPORTS,
                         CFG.DIR_EVIDENCE, CFG.DIR_PROCESSED_VIDEOS):
                 s3_upload.upload_tree(
@@ -667,6 +674,24 @@ def stage_finalize(manifest: BatchManifest, ctx: RunContext) -> None:
                   manifest.batch_key, e)
 
     _finish(manifest, ctx, terminal)
+
+    # ---- local-disk reclaim (Stage-6, after everything is uploaded) ----
+    # wagon_cache/ + downloads/ are ~80% of a batch's ~3 GB and are pure
+    # intermediates -- every durable artifact is already in S3 by now.  Runs only
+    # once the batch is TERMINAL (a late camera can no longer trigger a report
+    # that reads the cache) and only when it SUCCEEDED, so a failure keeps its
+    # intermediates on the box for diagnosis.  Never fails the batch.
+    try:
+        from delivery import retention
+        retention.run(
+            root, workspace_root=ctx.workspace_root,
+            terminal_status=manifest.terminal_status,
+            prune_intermediates=(terminal in (LifecycleState.COMPLETED,
+                                              LifecycleState.COMPLETED_PARTIAL)),
+        )
+    except Exception as e:
+        log.error("[FINALIZE %s] retention error (non-fatal): %s",
+                  manifest.batch_key, e)
 
 
 def _terminal_status_name(terminal_state: str) -> str:

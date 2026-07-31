@@ -43,9 +43,15 @@ log = get_logger("model_sync")
 # What a run needs
 # ---------------------------------------------------------------------------
 
+# Filenames that appear in MORE THAN ONE model tree with different weights.  Under
+# the flat (V4) S3 layout these cannot be told apart by key, so they are never
+# auto-downloaded -- see ModelReq.ambiguous_in_flat_layout.
+_AMBIGUOUS_FLAT_FILENAMES = C.AMBIGUOUS_MODEL_FILENAMES
+
+
 @dataclass
 class ModelReq:
-    category: str          # "reconstruction" | "features"
+    category: str          # "reconstruction" | "features" | "extraction"
     filename: str          # canonical filename (e.g. damage.pt)
     local_dir: str         # RECON_MODELS_DIR or FEAT_MODELS_DIR
     legacy: Optional[str] = None   # accepted legacy filename fallback
@@ -56,9 +62,17 @@ class ModelReq:
 
     @property
     def s3_key(self) -> str:
-        base = f"{C.MODELS_S3_PREFIX}/{self.category}" if C.MODELS_S3_PREFIX \
-            else self.category
-        return f"{base}/{self.filename}"
+        """Where this model lives in the models bucket.
+
+        `flat` (default) mirrors V4, which keeps every .pt at the bucket root:
+            s3://wagon-eye-models/<file>
+        `nested` adds the category folder, for a mirror organised by stage:
+            s3://<bucket>/<prefix>/reconstruction|features|extraction/<file>
+        """
+        parts = [p for p in (C.MODELS_S3_PREFIX,
+                             self.category if C.MODELS_S3_LAYOUT == "nested" else "",
+                             self.filename) if p]
+        return "/".join(parts)
 
     @property
     def s3_uri(self) -> str:
@@ -74,23 +88,49 @@ class ModelReq:
                 return legacy_path
         return None
 
+    @property
+    def ambiguous_in_flat_layout(self) -> bool:
+        """True when this filename is used by more than one CATEGORY.
 
-def required_models(enabled_features: Optional[List[str]] = None) -> List[ModelReq]:
+        ``side_classification.pt`` exists in BOTH `reconstruction/` (Stage-1
+        segment classifier) and `extraction/` (train-presence classifier) with
+        DIFFERENT weights.  Under the flat layout both would resolve to the same
+        ``s3://<bucket>/side_classification.pt``, so auto-downloading it would
+        silently install the wrong model in one of the two dirs.  We refuse to
+        download those and require them locally instead.
+        """
+        return (C.MODELS_S3_LAYOUT == "flat"
+                and self.filename in _AMBIGUOUS_FLAT_FILENAMES)
+
+
+def required_models(enabled_features: Optional[List[str]] = None,
+                    *, include_extraction: Optional[bool] = None) -> List[ModelReq]:
     """Return the ModelReq list for a run.
 
     `enabled_features` restricts the feature models (default: all four).  The
     reconstruction set is always included.
+
+    `include_extraction` adds the raw->trimmed EXTRACTION classify models.
+    Default (`None`) follows the resolved pipeline source: they are required only
+    when this process produces its own trimmed clips (`--source raw`), because a
+    pure consumer never loads them.
     """
     reqs: List[ModelReq] = [
         ModelReq("reconstruction", f, CFG.RECON_MODELS_DIR,
                  legacy=C.RECON_MODEL_LEGACY.get(f))
         for f in C.RECON_MODEL_FILES
     ]
+    if include_extraction is None:
+        include_extraction = CFG.PIPELINE_SOURCE.requires_extraction
+    if include_extraction:
+        reqs.extend(ModelReq("extraction", f, CFG.EXTRACTION_MODELS_DIR)
+                    for f in C.EXTRACTION_MODEL_FILES)
     keys = C.FEATURE_MODEL_BY_KEY.keys() if enabled_features is None \
         else [k for k in enabled_features if k in C.FEATURE_MODEL_BY_KEY]
     for k in keys:
-        reqs.append(ModelReq("features", C.FEATURE_MODEL_BY_KEY[k],
-                             CFG.FEAT_MODELS_DIR))
+        filename = C.FEATURE_MODEL_BY_KEY[k]
+        reqs.append(ModelReq("features", filename, CFG.FEAT_MODELS_DIR,
+                             legacy=C.FEATURE_MODEL_LEGACY.get(filename)))
     return reqs
 
 
@@ -199,6 +239,7 @@ def verify_and_sync(
     enabled_features: Optional[List[str]] = None,
     s3_client=None,
     download: bool = True,
+    include_extraction: Optional[bool] = None,
 ) -> SyncReport:
     """Verify every required model is present locally; download missing ones.
 
@@ -208,7 +249,7 @@ def verify_and_sync(
       configured; otherwise it is reported MISSING with the exact reason.
     """
     report = SyncReport()
-    reqs = required_models(enabled_features)
+    reqs = required_models(enabled_features, include_extraction=include_extraction)
     bucket_set = bool(C.MODELS_S3_BUCKET)
     client = s3_client
     if download and bucket_set and client is None:
@@ -238,6 +279,17 @@ def verify_and_sync(
                 req=req, present=False,
                 error="missing locally and no S3 client/credentials available"))
             continue
+        if req.ambiguous_in_flat_layout:
+            report.statuses.append(ModelStatus(
+                req=req, present=False,
+                error=(f"{req.filename} exists in more than one model category "
+                       f"with DIFFERENT weights, and the flat S3 layout cannot "
+                       f"tell them apart -- refusing to auto-download it into "
+                       f"{req.local_dir}.  Place it there explicitly (see "
+                       f"models/extraction/README.md), or set "
+                       f"WAGONEYE_MODELS_S3_LAYOUT=nested if your mirror has "
+                       f"per-category folders.")))
+            continue
         report.statuses.append(_download(client, req))
 
     return report
@@ -248,10 +300,12 @@ def ensure_models_or_report(
     enabled_features: Optional[List[str]] = None,
     s3_client=None,
     download: bool = True,
+    include_extraction: Optional[bool] = None,
 ) -> SyncReport:
     """verify_and_sync + log a one-block summary.  Caller decides fail-fast."""
     report = verify_and_sync(enabled_features=enabled_features,
-                             s3_client=s3_client, download=download)
+                             s3_client=s3_client, download=download,
+                             include_extraction=include_extraction)
     header = ("[MODEL_SYNC] model availability "
               f"(bucket={C.MODELS_S3_BUCKET or '<unset>'}, "
               f"prefix={C.MODELS_S3_PREFIX or '<root>'}):")

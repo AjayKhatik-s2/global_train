@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from core import camera_features as CF
+from core import constants as C
 
 _MARKER_ROOT = ".features"
 MARKER_SCHEMA_VERSION = 1
@@ -66,7 +67,10 @@ def compute_identity(
     global_state_version: str, feat_models_dir: str, enabled: bool = True,
 ) -> Dict[str, Any]:
     model_filename = CF.FEATURE_MODEL_FILENAME.get(feature, "")
-    model_path = os.path.join(feat_models_dir, model_filename) if model_filename else ""
+    # Resolve through the shared resolver so the marker hashes the file the
+    # processor will ACTUALLY load (canonical name, else accepted legacy name).
+    model_path = (C.feature_model_path(feat_models_dir, model_filename)
+                  if model_filename else "")
     return {
         "camera_id": camera_id,
         "feature": feature,

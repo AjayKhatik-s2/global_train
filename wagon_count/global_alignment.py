@@ -345,6 +345,40 @@ def fuse_master_timeline(
 # Ownership-based boundary assignment
 # -----------------------------------------------------------------------------
 
+def travel_direction(master_tracks: LocalCameraTracks) -> str:
+    """Direction the rake travels across the master camera's image plane.
+
+    Returns ``'left-to-right'`` / ``'right-to-left'`` / ``'unknown'`` -- the same
+    vocabulary the V4 Train-Inspection-Engine's optical-flow detector emits, so
+    the per-camera inspection JSON can report ``direction`` identically.
+
+    ESTIMATOR DIFFERS FROM V4 (documented on purpose): V4 runs dense Farneback
+    optical flow over ~10 s of video.  Here the sign is read off the gap tracks'
+    per-hit ``bbox_history`` -- which the tracker already produced -- so this
+    needs no video re-read, no model, and no extra CPU.  Both only ever use the
+    SIGN of horizontal motion, so the label agrees.
+
+    Each gap contributes one vote (the sign of its own centre_x drift); the
+    majority wins.  Ties and no-trajectory inputs return ``'unknown'`` rather
+    than guessing.
+    """
+    right = left = 0
+    for g in getattr(master_tracks, "gaps", None) or []:
+        bh = getattr(g, "bbox_history", None)
+        if not bh or len(bh) < 2:
+            continue
+        cx_first = (float(bh[0][0]) + float(bh[0][2])) / 2.0
+        cx_last = (float(bh[-1][0]) + float(bh[-1][2])) / 2.0
+        drift = cx_last - cx_first
+        if drift > 0:
+            right += 1
+        elif drift < 0:
+            left += 1
+    if right == left:
+        return "unknown"
+    return "left-to-right" if right > left else "right-to-left"
+
+
 def ownership_transition_frame(gap: GapEvent, frame_width: int) -> Optional[int]:
     """OWNERSHIP transition between the wagon before this gap and the wagon after.
 
@@ -865,6 +899,12 @@ def assemble_global_train_state(
                   f"Train end: {wagons[-1].global_id} ({wagons[-1].classification}) "
                   f"@f{wagons[-1].end_frame_master}")
 
+    # Travel direction off the master's existing gap trajectories (no re-read).
+    direction = travel_direction(master_tracks)
+    if verbose:
+        print(f"[STAGE1] Travel direction: {direction} "
+              f"(from {master_id} gap centre_x drift)")
+
     if verbose:
         print(f"[STAGE1] Global boundaries finalized -- Final Global Train: "
               f"{total} wagons ({master_id} canonical)")
@@ -882,6 +922,7 @@ def assemble_global_train_state(
         corrections_applied=[],
         fallback_used=fallback_used,
         fallback_reason=fallback_reason,
+        travel_direction=direction,
         notes=notes,
     )
     return state

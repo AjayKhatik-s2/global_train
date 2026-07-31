@@ -129,9 +129,39 @@ make_dirs() {
   mkdir -p \
     "${REPO_ROOT}/models/reconstruction" \
     "${REPO_ROOT}/models/features" \
+    "${REPO_ROOT}/models/extraction" \
     "${REPO_ROOT}/logs" \
+    "${REPO_ROOT}/logs/extraction_state" \
     "${REPO_ROOT}/batch_outputs" \
     "${REPO_ROOT}/local_inputs"
+}
+
+
+# ---------------------------------------------------------------------------
+# 5b. Git LFS -- the .pt weights are LFS-tracked (.gitattributes: *.pt filter=lfs),
+# so a plain `git clone` leaves pointer files behind and every model load fails.
+# ---------------------------------------------------------------------------
+setup_git_lfs() {
+  if command -v git-lfs >/dev/null 2>&1; then
+    log "git-lfs present"
+  else
+    log "Installing git-lfs"
+    if command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get install -y git-lfs || warn "git-lfs install failed"
+    elif command -v dnf >/dev/null 2>&1; then
+      sudo dnf install -y git-lfs || warn "git-lfs install failed"
+    elif command -v yum >/dev/null 2>&1; then
+      sudo yum install -y git-lfs || warn "git-lfs install failed (try amazon-linux-extras / EPEL)"
+    else
+      warn "unknown package manager -- install git-lfs manually"
+    fi
+  fi
+  if command -v git-lfs >/dev/null 2>&1; then
+    git lfs install --local 2>/dev/null || git lfs install || true
+    log "Fetching LFS model weights (git lfs pull)"
+    ( cd "${REPO_ROOT}" && git lfs pull ) || \
+      warn "git lfs pull failed -- fetch the .pt weights manually before starting"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -161,6 +191,7 @@ main() {
   setup_venv
   setup_torch
   make_dirs
+  setup_git_lfs
   verify
   cat <<EOF
 

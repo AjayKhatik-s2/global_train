@@ -1,5 +1,16 @@
 # systemd unit for the WagonEye v4 continuous pipeline (--auto S3 polling).
 #
+# TOPOLOGY -- this ONE unit can run the whole pipeline end to end:
+#   raw CCTV -> extract train -> inspect -> fuse -> report -> deliver
+# Set  WAGONEYE_PIPELINE_SOURCE=raw  in deploy/wagon-eye.env (or add
+# `--source raw` to ExecStart below) and the orchestrator owns an
+# ExtractionManager that produces the trimmed clips it then consumes.  In that
+# mode you do NOT also run wagon-eye-extraction.service -- two producers would
+# extract the same raw clips twice.
+#
+# Leave the source at its default (`trimmed`) for the two-service topology:
+# wagon-eye-extraction.service produces, this unit consumes.
+#
 # INSTALL:
 #   1. Edit the three placeholders below marked  <<EDIT>>  :
 #        User            the Linux user that owns the checkout + venv

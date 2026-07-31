@@ -35,7 +35,7 @@ FEATURE_DAMAGE = "damage"
 # a completion marker -- a model swap must invalidate prior results.
 FEATURE_MODEL_FILENAME: Dict[str, str] = {
     FEATURE_DOOR:   C.MODEL_DOOR_STATE,
-    FEATURE_OCR:    C.MODEL_WAGON_ID_COUNTING,
+    FEATURE_OCR:    C.MODEL_WAGON_NUMBER,
     FEATURE_LOAD:   C.MODEL_LOADED,
     FEATURE_DAMAGE: C.MODEL_DAMAGE,
 }

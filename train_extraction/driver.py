@@ -62,31 +62,52 @@ ALL_CAMERAS = (RIGHT_UP, LEFT_UP, RIGHT_UP_TOP, LEFT_UP_TOP)
 # the classify-model filename expected under the extraction models dir.
 # -----------------------------------------------------------------------------
 
+# Buckets + per-camera folders come from core.constants (the single source of
+# truth, defaulted to the V4 bucket set) via _BUCKETS below, so the producer and
+# the consumer can never drift apart.  Only the classify model and the ignore list
+# are genuinely per-camera here.
+_CAMERA_FOLDER = {
+    RIGHT_UP:     "camera_CCTV_HZBN_DHN_2_RIGHT_UP",
+    LEFT_UP:      "camera_CCTV_HZBN_DHN_1_LEFT_UP",
+    RIGHT_UP_TOP: "camera_CCTV_HZBN_DHN_5_RIGHT_TOP",
+    LEFT_UP_TOP:  "camera_CCTV_HZBN_DHN_6_LEFT_TOP",
+}
+_RAW_BUCKET_DEFAULT = "biro-wagon-raw-video-copy"
+_TRIMMED_BUCKET_DEFAULT = "biro-wagon-pre-processed-video-copy"
+
+
+def _buckets():
+    """(raw_bucket, trimmed_bucket) from core.constants when importable.
+
+    This producer is deliberately importable WITHOUT the inspection package (it
+    is also run standalone), so core.constants is a soft dependency: present ->
+    share its V4 defaults + env overrides; absent -> the same literals.
+    """
+    try:
+        from core import constants as C
+        return C.S3_RAW_VIDEO_BUCKET, C.S3_TRIMMED_VIDEO_BUCKET
+    except Exception:
+        return (os.environ.get("WAGONEYE_S3_RAW_VIDEO_BUCKET", _RAW_BUCKET_DEFAULT),
+                os.environ.get("WAGONEYE_S3_TRIMMED_VIDEO_BUCKET",
+                               _TRIMMED_BUCKET_DEFAULT))
+
+
+def _camera_config(camera: str) -> Dict[str, object]:
+    raw_b, trim_b = _buckets()
+    folder = _CAMERA_FOLDER[camera]
+    return {
+        "raw":     f"{raw_b}/{folder}",
+        "trimmed": f"{trim_b}/{folder}",
+        "model":   ("side_classification.pt" if camera in (RIGHT_UP, LEFT_UP)
+                    else "top_classification.pt"),
+        # A parallel train on the second track is ignored on right_up only
+        # (V4 right_up.yaml: extraction_ignore_class_names).
+        "ignore":  ["second_track"] if camera == RIGHT_UP else [],
+    }
+
+
 _CAMERA_CONFIG: Dict[str, Dict[str, object]] = {
-    RIGHT_UP: {
-        "raw":     "biro-wagon-raw-video-copy/camera_CCTV_HZBN_DHN_2_RIGHT_UP",
-        "trimmed": "biro-wagon-pre-processed-video-copy/camera_CCTV_HZBN_DHN_2_RIGHT_UP",
-        "model":   "side_classification.pt",
-        "ignore":  ["second_track"],   # a parallel train is ignored (V4 right_up.yaml)
-    },
-    LEFT_UP: {
-        "raw":     "biro-wagon-raw-video-copy/camera_CCTV_HZBN_DHN_1_LEFT_UP",
-        "trimmed": "biro-wagon-pre-processed-video-copy/camera_CCTV_HZBN_DHN_1_LEFT_UP",
-        "model":   "side_classification.pt",
-        "ignore":  [],
-    },
-    RIGHT_UP_TOP: {
-        "raw":     "biro-wagon-raw-video-copy/camera_CCTV_HZBN_DHN_5_RIGHT_TOP",
-        "trimmed": "biro-wagon-pre-processed-video-copy/camera_CCTV_HZBN_DHN_5_RIGHT_TOP",
-        "model":   "top_classification.pt",
-        "ignore":  [],
-    },
-    LEFT_UP_TOP: {
-        "raw":     "biro-wagon-raw-video-copy/camera_CCTV_HZBN_DHN_6_LEFT_TOP",
-        "trimmed": "biro-wagon-pre-processed-video-copy/camera_CCTV_HZBN_DHN_6_LEFT_TOP",
-        "model":   "top_classification.pt",
-        "ignore":  [],
-    },
+    cam: _camera_config(cam) for cam in ALL_CAMERAS
 }
 
 # Extraction classify models live here by default.  IMPORTANT: these are the

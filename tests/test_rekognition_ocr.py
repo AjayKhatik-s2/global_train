@@ -509,6 +509,42 @@ def test_loco_plate_class_is_never_guessed():
     assert P._is_plate_class(None, known, kind="wagon") is True
 
 
+def test_deployed_plate_model_serves_both_ocr_paths():
+    """The class names `wagon_number_update.pt` actually ships with.
+
+    Verified on the production box: `{0: 'loco_no', 1: 'wagon_id'}`.  Pinning them
+    here means a model swap that renames a class fails a test rather than silently
+    reading no loco numbers in the field.
+    """
+    from features.ocr import processor as P
+    assert P.plate_classes_resolvable(["loco_no", "wagon_id"]) == {
+        "wagon": True, "loco": True}
+
+
+def test_a_model_without_a_loco_class_disables_only_the_loco_path():
+    from features.ocr import processor as P
+    assert P.plate_classes_resolvable(["wagonno"]) == {"wagon": True, "loco": False}
+    assert P.plate_classes_resolvable([]) == {"wagon": True, "loco": False}
+    # case and ordering are irrelevant
+    assert P.plate_classes_resolvable(["WAGON_ID", "Loco_No"])["loco"] is True
+
+
+def test_unservable_loco_model_warns_loudly_instead_of_failing_silently(caplog):
+    """The old failure mode: every detection dropped, nothing in the log to say why."""
+    import logging
+    from features.ocr import processor as P
+    P._WARNED_NO_LOCO_CLASS.clear()
+    with caplog.at_level(logging.WARNING, logger="features.ocr"):
+        assert P._warn_if_loco_unservable({"wagonno"}) is False
+        assert P._warn_if_loco_unservable({"wagonno"}) is False   # once per model
+    warnings = [r for r in caplog.records if "loco-number OCR DISABLED" in r.message]
+    assert len(warnings) == 1
+    # a servable model says nothing at all
+    caplog.clear()
+    assert P._warn_if_loco_unservable({"loco_no", "wagon_id"}) is True
+    assert not caplog.records
+
+
 def test_wagon_number_model_detects_both_plate_classes():
     """wagon_number_update.pt / wagon_id_counting.pt emit loco_no AND wagon_id,
     so one detector serves both OCR paths."""

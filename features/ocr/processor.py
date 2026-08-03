@@ -129,6 +129,51 @@ LOCO_NUMBER_CLASS_ALIASES = {"loco_no": "loco_no", "locono": "loco_no",
 _CANONICAL_LOCO_CLASS = "loco_no"
 
 
+def plate_classes_resolvable(known_names) -> Dict[str, bool]:
+    """Which OCR paths this plate detector's class list can actually serve.
+
+    ``{"wagon": bool, "loco": bool}``.  The WAGON path is always servable -- an
+    unrecognised vocabulary falls back to "every box is a wagon-plate candidate".
+    The LOCO path is servable ONLY when a class maps to a known loco alias,
+    because it refuses to guess (see `_is_plate_class`).
+
+    Exposed so `scripts/verify_runtime.py` can fail a bad model swap up front
+    instead of letting Stage 3 read nothing hours into a batch.
+    """
+    known = {str(n).lower() for n in (known_names or ())}
+    return {
+        "wagon": True,
+        "loco": bool(known & set(LOCO_NUMBER_CLASS_ALIASES)),
+    }
+
+
+#: One warning per process per model, not one per wagon.
+_WARNED_NO_LOCO_CLASS: set = set()
+
+
+def _warn_if_loco_unservable(known_names: set) -> bool:
+    """True when the loco path can run.  Logs ONCE per distinct class list if not.
+
+    Without this the failure is silent: `_is_plate_class` drops every detection,
+    Stage 3 records no loco number, and the report simply shows "-" with nothing
+    in the log to say why.
+    """
+    if plate_classes_resolvable(known_names)["loco"]:
+        return True
+    key = ",".join(sorted(known_names))
+    if key not in _WARNED_NO_LOCO_CLASS:
+        _WARNED_NO_LOCO_CLASS.add(key)
+        log.warning(
+            "loco-number OCR DISABLED: the plate model's classes %s contain none "
+            "of the known locomotive labels %s, and the loco path will not guess "
+            "(a misread 11-digit wagon plate must never be reported as a loco "
+            "number).  Rename the model's loco class or add its label to "
+            "LOCO_NUMBER_CLASS_ALIASES; wagon-number OCR is unaffected.",
+            sorted(known_names) or "(none)",
+            sorted(LOCO_NUMBER_CLASS_ALIASES))
+    return False
+
+
 def _is_plate_class(class_name: Optional[str], known_names: set,
                     *, kind: str = "wagon") -> bool:
     """True when a detection should be treated as a plate of the given `kind`.
@@ -229,6 +274,8 @@ def _detect_plates_for_wagon(
     """
     known = {str(n).lower() for n in model_class_names(yolo_model).values()}
     names = model_class_names(yolo_model)
+    if kind == "loco" and not _warn_if_loco_unservable(known):
+        return []
     detections: List[Dict[str, Any]] = []
     for fi, _frame, boxes, confs, clss in iter_wagon_detections(
             yolo_model, cache_root, gw_id, camera_id, trim_stable=True, fp16=True):

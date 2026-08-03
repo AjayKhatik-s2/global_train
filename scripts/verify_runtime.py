@@ -136,12 +136,37 @@ def check_models(skip: bool) -> list:
             m = load_yolo(path)
             if m is None:
                 raise RuntimeError("loader returned None (LFS pointer or unreadable)")
-            n = len(getattr(m, "names", {}) or {})
-            print(f"  [{ok('PASS')}] {label}  ({n} classes)")
+            names = getattr(m, "names", {}) or {}
+            print(f"  [{ok('PASS')}] {label}  ({len(names)} classes)")
+            if fn == C.MODEL_WAGON_NUMBER:
+                failures += _check_plate_classes(label, names)
         except Exception as e:
             print(f"  [{bad('FAIL')}] {label}  {type(e).__name__}: {str(e)[:120]}")
             failures.append((label, str(e)))
     return failures
+
+
+def _check_plate_classes(label: str, names) -> list:
+    """The plate detector serves BOTH OCR paths, keyed on its class names.
+
+    The wagon path is permissive (unknown vocabulary -> every box is a candidate),
+    but the loco path refuses to guess -- so a model whose loco class is named
+    something unexpected reads NOTHING, and does it silently.  Catch that here.
+    """
+    from features.ocr.processor import (plate_classes_resolvable,
+                                        LOCO_NUMBER_CLASS_ALIASES)
+    values = list((names or {}).values())
+    servable = plate_classes_resolvable(values)
+    print(f"           classes: {sorted(str(v) for v in values)}")
+    if servable["loco"]:
+        print(f"  [{ok('PASS')}] {label}  serves both wagon (11-digit) and "
+              f"loco (5-digit) OCR")
+        return []
+    print(f"  [{warn('WARN')}] {label}  no locomotive class -- loco-number OCR "
+          f"will be skipped")
+    print(f"           expected one of: {sorted(LOCO_NUMBER_CLASS_ALIASES)}")
+    print(f"           wagon-number OCR is unaffected")
+    return []
 
 
 def check_tools() -> list:

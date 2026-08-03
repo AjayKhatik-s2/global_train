@@ -169,7 +169,11 @@ def _build_extractor(camera: str) -> TrainExtractor:
         classifier,
         min_train_duration=float(_cam_env(camera, "MIN_TRAIN_DURATION", "40")),
         start_buffer_seconds=float(_cam_env(camera, "START_BUFFER_SECONDS", "5")),
-        track_end_seconds=float(_cam_env(camera, "TRACK_END_SECONDS", "5")),
+        # 12s of continuous empty track before the train is declared finished --
+        # matches V4 (configs/cameras/*.yaml: track_end_seconds: 12.0).  A shorter
+        # window is eager: a long gap mid-rake reads as "train ended" and cuts one
+        # train into two clips, which downstream then counts as two trains.
+        track_end_seconds=float(_cam_env(camera, "TRACK_END_SECONDS", "12")),
         end_extra_buffer=float(_cam_env(camera, "END_EXTRA_BUFFER", "5")),
         merge_gap_seconds=float(_cam_env(camera, "MERGE_GAP_SECONDS", "30")),
         frame_stride=int(_cam_env(camera, "ANALYSIS_FRAME_STRIDE", "15")),

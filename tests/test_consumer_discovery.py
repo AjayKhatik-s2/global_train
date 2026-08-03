@@ -183,3 +183,92 @@ def test_output_order_is_deterministic(monkeypatch):
 def test_incomplete_detection():
     assert TBM._is_incomplete(f"{LU}/x_20260803_120000_train_incomplete.mp4")
     assert not TBM._is_incomplete(f"{LU}/x_20260803_120000_train.mp4")
+
+
+# --- active-manifest resume must also be bounded by train age ----------------
+
+def test_stale_manifest_window_follows_the_consumer_window(monkeypatch):
+    from orchestrator import batch_manifest as BM
+    monkeypatch.delenv("WAGONEYE_STALE_MANIFEST_MINUTES", raising=False)
+    monkeypatch.delenv("WAGONEYE_CONSUMER_LOOKBACK_MINUTES", raising=False)
+    assert BM.stale_manifest_minutes() == TBM.consumer_lookback_minutes()
+
+
+def test_stale_manifest_window_override(monkeypatch):
+    from orchestrator import batch_manifest as BM
+    monkeypatch.setenv("WAGONEYE_STALE_MANIFEST_MINUTES", "180")
+    assert BM.stale_manifest_minutes() == 180.0
+    monkeypatch.setenv("WAGONEYE_STALE_MANIFEST_MINUTES", "nonsense")
+    assert BM.stale_manifest_minutes() == TBM.consumer_lookback_minutes()
+
+
+def test_old_manifests_are_not_resumed(monkeypatch):
+    """The incident: 423 stale manifests were reloaded as active and began
+    sealing months-old trains."""
+    from orchestrator import batch_manifest as BM
+    monkeypatch.delenv("WAGONEYE_STALE_MANIFEST_MINUTES", raising=False)
+
+    now_key = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    keys = ["20260414_144045", "20260719_134555", now_key]
+    fetched = []
+
+    class S3:
+        def list_objects_v2(self, **kw):
+            return {"CommonPrefixes": [{"Prefix": f"train_batch/{k}/"} for k in keys],
+                    "IsTruncated": False}
+
+    def fake_load(s3, key, bucket=None):
+        fetched.append(key)
+        m = BM.BatchManifest.new(batch_key=key, train_timestamp=key)
+        return m
+
+    monkeypatch.setattr(BM, "load_s3", fake_load)
+    got = BM.list_active_manifests(S3(), processed_batches={})
+
+    assert [m.batch_key for m in got] == [now_key]
+    # and the old ones were skipped WITHOUT a GetObject
+    assert fetched == [now_key]
+
+
+def test_terminal_batches_still_skipped(monkeypatch):
+    from orchestrator import batch_manifest as BM
+    now_key = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    class S3:
+        def list_objects_v2(self, **kw):
+            return {"CommonPrefixes": [{"Prefix": f"train_batch/{now_key}/"}],
+                    "IsTruncated": False}
+
+    monkeypatch.setattr(BM, "load_s3",
+                        lambda *a, **k: pytest.fail("must not fetch a terminal batch"))
+    assert BM.list_active_manifests(S3(), processed_batches={now_key: "completed"}) == []
+
+
+def test_zero_disables_the_resume_bound(monkeypatch):
+    from orchestrator import batch_manifest as BM
+
+    class S3:
+        def list_objects_v2(self, **kw):
+            return {"CommonPrefixes": [{"Prefix": "train_batch/20260414_144045/"}],
+                    "IsTruncated": False}
+
+    monkeypatch.setattr(BM, "load_s3", lambda s3, key, bucket=None:
+                        BM.BatchManifest.new(batch_key=key, train_timestamp=key))
+    got = BM.list_active_manifests(S3(), processed_batches={},
+                                   stale_after_minutes=0)
+    assert [m.batch_key for m in got] == ["20260414_144045"]
+
+
+def test_unparseable_batch_key_is_not_dropped(monkeypatch):
+    """Never silently discard a manifest we cannot date."""
+    from orchestrator import batch_manifest as BM
+
+    class S3:
+        def list_objects_v2(self, **kw):
+            return {"CommonPrefixes": [{"Prefix": "train_batch/weird-key/"}],
+                    "IsTruncated": False}
+
+    monkeypatch.setattr(BM, "load_s3", lambda s3, key, bucket=None:
+                        BM.BatchManifest.new(batch_key=key, train_timestamp=key))
+    got = BM.list_active_manifests(S3(), processed_batches={})
+    assert [m.batch_key for m in got] == ["weird-key"]

@@ -312,11 +312,50 @@ def load_s3(s3_client, batch_key: str, bucket: Optional[str] = None) -> Optional
         return None
 
 
+def stale_manifest_minutes() -> float:
+    """Train-age bound for resuming a manifest, in minutes (0 = no bound).
+
+    Defaults to the consumer discovery window so the two agree: if a train is too
+    old to be DISCOVERED, it is too old to be RESUMED.
+    """
+    raw = os.getenv("WAGONEYE_STALE_MANIFEST_MINUTES")
+    if raw is not None and raw != "":
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    try:
+        from orchestrator.train_batch_manager import consumer_lookback_minutes
+        return consumer_lookback_minutes()
+    except Exception:
+        return 60.0
+
+
+def _stale_manifest_cutoff(stale_after_minutes: Optional[float]):
+    mins = (stale_manifest_minutes() if stale_after_minutes is None
+            else max(0.0, float(stale_after_minutes)))
+    if mins <= 0:
+        return None
+    from datetime import timedelta
+    return _now() - timedelta(minutes=mins)
+
+
+def _train_dt(batch_key: str):
+    """Parse the `YYYYMMDD_HHMMSS` batch key into a UTC datetime, or None."""
+    from datetime import datetime, timezone
+    try:
+        return datetime.strptime(batch_key, "%Y%m%d_%H%M%S").replace(
+            tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
 def list_active_manifests(
     s3_client,
     *,
     processed_batches: Dict[str, str],
     bucket: Optional[str] = None,
+    stale_after_minutes: Optional[float] = None,
 ) -> List[BatchManifest]:
     """Discover non-terminal manifests by LISTING the train_batch/ prefix.
 
@@ -324,6 +363,18 @@ def list_active_manifests(
     fetch.  This is the concurrency-safe alternative to a shared active-index
     file: each manifest object is single-writer, and the active set is
     reconciled by listing rather than mutating shared state.
+
+    BOUNDED BY TRAIN AGE.  Without a bound this resurrected every manifest ever
+    written: an interrupted run left 423 non-terminal manifests behind, and the
+    next start reloaded all of them as "active" and began sealing months-old
+    trains -- discovery's recency window cannot help, because this path never
+    goes through discovery.  A manifest whose TRAIN TIMESTAMP is older than
+    `stale_after_minutes` is skipped UNLESS it has a sealed GlobalTrainState
+    (real work in flight, which must always be allowed to finish).
+
+    The bound is on the train's own timestamp, not on when we first saw it: a
+    freshly-created manifest for an ancient train has `first_seen = now`, so the
+    lifecycle deadlines never fire for it.
     """
     from core.lifecycle import is_terminal
 
@@ -332,6 +383,8 @@ def list_active_manifests(
     out: List[BatchManifest] = []
     token = None
     seen_keys: set = set()
+    stale_cutoff = _stale_manifest_cutoff(stale_after_minutes)
+    n_stale = 0
     while True:
         kwargs = {"Bucket": bucket, "Prefix": prefix, "Delimiter": "/"}
         if token:
@@ -349,6 +402,14 @@ def list_active_manifests(
             seen_keys.add(key)
             if key in processed_batches:
                 continue                        # terminal -- skip
+            # Age gate BEFORE the fetch: an old train is skipped without paying
+            # for a GetObject, which is what made reloading hundreds of stale
+            # manifests slow as well as wrong.
+            if stale_cutoff is not None:
+                tdt = _train_dt(key)
+                if tdt is not None and tdt < stale_cutoff:
+                    n_stale += 1
+                    continue
             m = load_s3(s3_client, key, bucket=bucket)
             if m is None:
                 continue
@@ -361,4 +422,9 @@ def list_active_manifests(
                 break
         else:
             break
+    if n_stale:
+        log.info("[MANIFEST] skipped %d stale manifest(s) whose train is older "
+                 "than the resume window (%.0fmin)", n_stale,
+                 stale_manifest_minutes() if stale_after_minutes is None
+                 else stale_after_minutes)
     return out

@@ -51,7 +51,21 @@ class S3Client:
     # --- listing ---------------------------------------------------------
 
     def list_objects(self, bucket_string: str, prefix: str = "") -> list[dict]:
-        bucket, _ = split_bucket_prefix(bucket_string)
+        """List objects under ``bucket_string``, honouring a prefix EMBEDDED in it.
+
+        ``bucket_string`` is a ``"bucket/optional/prefix"`` value (e.g.
+        ``biro-wagon-raw-video-copy/camera_CCTV_HZBN_DHN_2_RIGHT_UP``).  The
+        embedded prefix used to be split off and DISCARDED, so a caller that
+        passed no explicit `prefix` listed the WHOLE bucket -- every camera's
+        folder -- and the per-camera extractor then processed other cameras'
+        video with the wrong classifier.
+
+        Now the embedded prefix is the default scope; an explicit `prefix`
+        argument still wins so callers can narrow further.
+        """
+        bucket, embedded = split_bucket_prefix(bucket_string)
+        if not prefix and embedded:
+            prefix = f"{embedded}/"
         results: list[dict] = []
         token = None
         while True:

@@ -83,17 +83,81 @@ def _save_ledger(camera: str, processed: Set[str]) -> None:
 # one sweep of one camera
 # -----------------------------------------------------------------------------
 
+def lookback_minutes() -> float:
+    """How far back to consider raw clips, in minutes (0 = no limit).
+
+    A raw bucket holds months of CCTV.  Without a window, a fresh install (or any
+    install whose dedup ledger is incomplete) starts at the OLDEST clip and grinds
+    forward through the entire history before it reaches anything current -- which
+    is exactly what happened on first run: it began with a February clip.
+
+    The window makes "start the pipeline" mean "process trains from RIGHT NOW",
+    which is what an operator expects.  Default 10 minutes.
+
+    TRADE-OFF: clips older than the window are skipped PERMANENTLY, so if the
+    service is down longer than this, video from the gap is never extracted.
+    Raise it to cover your expected downtime, or set 0 to process everything the
+    dedup ledger hasn't already handled (the old behaviour).
+    """
+    raw = os.environ.get("WAGONEYE_EXTRACTION_LOOKBACK_MINUTES")
+    if raw is None or raw == "":
+        return 10.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 10.0
+
+
 def _list_raw_keys(ex, raw_bucket: str) -> List[str]:
-    """Sorted video keys under the camera's raw bucket/prefix."""
+    """Sorted video keys under the camera's raw bucket/prefix, newest-first window.
+
+    `raw_bucket` carries the camera's prefix (``bucket/camera_CCTV_...``), which
+    `S3Client.list_objects` now applies -- so this lists ONLY that camera's
+    folder, not the whole bucket.
+
+    Objects older than `lookback_minutes()` are dropped, judged by the S3 object's
+    own LastModified (authoritative; no filename parsing needed).  An object with
+    no LastModified is KEPT rather than silently discarded.
+    """
     objs = ex.s3.list_objects(raw_bucket)
-    keys = [o["Key"] for o in objs
+    vids = [o for o in objs
             if str(o.get("Key", "")).lower().endswith(_VIDEO_EXTS)]
-    return sorted(keys)
+
+    window = lookback_minutes()
+    if window <= 0:
+        return sorted(o["Key"] for o in vids)
+
+    from datetime import datetime, timedelta, timezone
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window)
+    fresh, stale = [], 0
+    for o in vids:
+        lm = o.get("LastModified")
+        if lm is None:
+            fresh.append(o["Key"])
+            continue
+        if getattr(lm, "tzinfo", None) is None:
+            lm = lm.replace(tzinfo=timezone.utc)
+        if lm >= cutoff:
+            fresh.append(o["Key"])
+        else:
+            stale += 1
+    if stale:
+        log.info("lookback %.0fmin: %d of %d raw clip(s) are older than the "
+                 "window and were skipped", window, stale, len(vids))
+    return sorted(fresh)
+
+
+def _s3_processed(ex) -> Set[str]:
+    """Already-cut raw keys from the extractor's S3 state store (best-effort)."""
+    try:
+        return set(getattr(ex.state, "processed_videos", None) or set())
+    except Exception:
+        return set()
 
 
 def sweep_camera(camera: str, *, dry_run: bool = False) -> Dict[str, int]:
     """Extract every not-yet-processed raw clip for one camera."""
-    result = {"listed": 0, "new": 0, "trains": 0, "errors": 0}
+    result = {"listed": 0, "new": 0, "trains": 0, "errors": 0, "foreign": 0}
     try:
         ex = D.get_extractor(camera)
     except FileNotFoundError as e:
@@ -102,14 +166,39 @@ def sweep_camera(camera: str, *, dry_run: bool = False) -> Dict[str, int]:
         return result
     raw_bucket = D.raw_bucket_for(camera)
 
+    # Dedup set = the LOCAL ledger UNION the extractor's S3 state store.
+    #
+    # The local ledger lives in the checkout (logs/extraction_state/), so a fresh
+    # clone or a moved install starts empty -- and because `extract()` only ever
+    # ADDS to the S3 state and never consults it, an empty ledger meant the sweep
+    # re-extracted the entire raw history from the oldest clip forward.  Folding
+    # the S3 state in makes the dedup survive a rebuild: it is the authoritative
+    # record of what this pipeline has already cut.
     processed = _load_ledger(camera)
+    s3_seen = _s3_processed(ex)
+    if s3_seen:
+        before = len(processed)
+        processed |= s3_seen
+        if len(processed) > before:
+            log.info("[%s] dedup: %d local + %d from the S3 state store -> %d keys",
+                     camera, before, len(s3_seen), len(processed))
     keys = _list_raw_keys(ex, raw_bucket)
     result["listed"] = len(keys)
 
+    # The camera's own prefix within the raw bucket ("" when the bucket has none).
+    expected = raw_bucket.split("/", 1)[1] if "/" in raw_bucket else ""
     for key in keys:
         if _STOP:
             break
         if key in processed:
+            continue
+        # Defence in depth: never hand one camera's video to another camera's
+        # extractor.  A listing that escapes its prefix (or a mis-set bucket) would
+        # otherwise run the SIDE classifier over a TOP view and cut nonsense.
+        if expected and not key.startswith(expected):
+            result["foreign"] = result.get("foreign", 0) + 1
+            log.warning("[%s] SKIP foreign key not under %s/: %s",
+                        camera, expected, key)
             continue
         result["new"] += 1
         if dry_run:
@@ -167,8 +256,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             if _STOP:
                 break
             r = sweep_camera(camera, dry_run=args.dry_run)
-            log.info("[%s] sweep: listed=%d new=%d trains=%d errors=%d",
-                     camera, r["listed"], r["new"], r["trains"], r["errors"])
+            log.info("[%s] sweep: listed=%d new=%d trains=%d foreign=%d errors=%d",
+                     camera, r["listed"], r["new"], r["trains"],
+                     r.get("foreign", 0), r["errors"])
         if args.once or _STOP:
             break
         # interruptible sleep between sweeps

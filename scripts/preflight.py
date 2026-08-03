@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from typing import Optional
 import os
 import sys
 
@@ -161,7 +162,7 @@ def check_models(res: Result, disabled: list, do_sync: bool) -> None:
               "`git lfs pull`)")
 
 
-def check_aws(res: Result) -> None:
+def check_aws(res: Result, disabled: Optional[list] = None) -> None:
     from core import constants as C
     print(_hdr("\n[5/5] AWS / S3 connectivity + IAM"))
     try:
@@ -194,11 +195,25 @@ def check_aws(res: Result) -> None:
     else:
         res.warn("output bucket unset (WAGONEYE_S3_OUTPUT_BUCKET)")
 
-    # model bucket GetObject (IAM check on one recon key)
+    # Model-bucket GetObject.  The key MUST come from ModelReq.s3_key so this
+    # honours WAGONEYE_MODELS_S3_LAYOUT (flat == V4's bucket-root layout);
+    # hardcoding a nested "reconstruction/<file>" key probed a path that does not
+    # exist in the default flat layout and failed spuriously.
+    #
+    # And auto-sync only ever fires for a model that is MISSING locally, so when
+    # every required model is already present this probe is informational: a
+    # missing bucket object cannot affect the run.  Report it, don't block on it.
     if C.MODELS_S3_BUCKET:
-        key = (f"{C.MODELS_S3_PREFIX}/reconstruction/{C.MODEL_SIDE_CLASSIFICATION}"
-               if C.MODELS_S3_PREFIX
-               else f"reconstruction/{C.MODEL_SIDE_CLASSIFICATION}")
+        from core import model_sync as MS
+        from core.feature_config import FeatureConfig
+        enabled = FeatureConfig.from_disabled(disabled or []).enabled_keys()
+        reqs = MS.required_models(enabled)
+        all_present = all(r.existing_local() for r in reqs)
+        probe = next((r for r in reqs if r.filename == C.MODEL_SIDE_CLASSIFICATION),
+                     reqs[0] if reqs else None)
+        if probe is None:
+            return
+        key = probe.s3_key
         try:
             s3.head_object(Bucket=C.MODELS_S3_BUCKET, Key=key)
             res.check(True, f"model bucket GetObject ({C.MODELS_S3_BUCKET}/{key})")
@@ -208,12 +223,30 @@ def check_aws(res: Result) -> None:
                 code = e.response.get("Error", {}).get("Code", "")  # type: ignore[attr-defined]
             except Exception:
                 pass
-            hint = ("object missing -- check MODELS_S3_PREFIX/layout"
-                    if code in ("404", "NoSuchKey")
-                    else "IAM lacks s3:GetObject" if code in ("403", "AccessDenied")
-                    else "")
-            res.check(False, f"model bucket access ({C.MODELS_S3_BUCKET}/{key})",
-                      f"{code or type(e).__name__} {hint}")
+            if code in ("403", "AccessDenied"):
+                # A real permission problem is worth blocking on only if sync
+                # could ever be needed.
+                msg = "IAM lacks s3:GetObject on the model bucket"
+                res.warn(f"model bucket access ({C.MODELS_S3_BUCKET}/{key})", msg) \
+                    if all_present else \
+                    res.check(False, f"model bucket access ({C.MODELS_S3_BUCKET}/{key})", msg)
+            elif code in ("404", "NoSuchKey"):
+                msg = (f"no object at that key "
+                       f"(layout={C.MODELS_S3_LAYOUT}, prefix="
+                       f"{C.MODELS_S3_PREFIX or '<root>'})")
+                if all_present:
+                    res.warn(f"model bucket probe ({C.MODELS_S3_BUCKET}/{key})",
+                             msg + " -- harmless: every required model is already "
+                                   "present locally, so auto-sync never runs")
+                else:
+                    res.check(False,
+                              f"model bucket access ({C.MODELS_S3_BUCKET}/{key})",
+                              msg + " -- and a model IS missing locally, so sync "
+                                    "is required.  Set WAGONEYE_MODELS_S3_LAYOUT/"
+                                    "PREFIX to match your mirror.")
+            else:
+                res.warn(f"model bucket probe ({C.MODELS_S3_BUCKET}/{key})",
+                         f"{code or type(e).__name__}: {e}")
     else:
         res.warn("model bucket unset (WAGONEYE_MODELS_S3_BUCKET)",
                  "auto model-sync disabled; models must be present locally")
@@ -288,7 +321,7 @@ def main(argv=None) -> int:
     check_config(res, args.mode, disabled)
     check_models(res, disabled, do_sync=args.sync)
     if not args.no_aws:
-        check_aws(res)
+        check_aws(res, disabled)
     else:
         print(_hdr("\n[5/5] AWS / S3 -- skipped (--no-aws)"))
 

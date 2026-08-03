@@ -332,12 +332,26 @@ def stale_manifest_minutes() -> float:
 
 
 def _stale_manifest_cutoff(stale_after_minutes: Optional[float]):
-    mins = (stale_manifest_minutes() if stale_after_minutes is None
-            else max(0.0, float(stale_after_minutes)))
-    if mins <= 0:
-        return None
+    """Resume bound: the operational-day anchor by default.
+
+    A manifest is resumable if its TRAIN belongs to the current operational day
+    (05:00 IST anchor) -- the same rule discovery uses, so "too old to discover"
+    and "too old to resume" can never disagree.  An explicit minutes value (arg or
+    WAGONEYE_STALE_MANIFEST_MINUTES) switches to a sliding window; 0 disables.
+    """
     from datetime import timedelta
-    return _now() - timedelta(minutes=mins)
+    if stale_after_minutes is not None:
+        mins = max(0.0, float(stale_after_minutes))
+        return None if mins <= 0 else _now() - timedelta(minutes=mins)
+    if os.getenv("WAGONEYE_STALE_MANIFEST_MINUTES"):
+        mins = stale_manifest_minutes()
+        return None if mins <= 0 else _now() - timedelta(minutes=mins)
+    try:
+        from core import config as CFG
+        return CFG.discovery_cutoff_utc()
+    except Exception:
+        mins = stale_manifest_minutes()
+        return None if mins <= 0 else _now() - timedelta(minutes=mins)
 
 
 def _train_dt(batch_key: str):
@@ -423,8 +437,7 @@ def list_active_manifests(
         else:
             break
     if n_stale:
-        log.info("[MANIFEST] skipped %d stale manifest(s) whose train is older "
-                 "than the resume window (%.0fmin)", n_stale,
-                 stale_manifest_minutes() if stale_after_minutes is None
-                 else stale_after_minutes)
+        log.info("[MANIFEST] skipped %d stale manifest(s) whose train predates "
+                 "the resume window (from %s)", n_stale,
+                 stale_cutoff.isoformat() if stale_cutoff else "n/a")
     return out

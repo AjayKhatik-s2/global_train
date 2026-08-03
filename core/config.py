@@ -28,6 +28,7 @@ Environment variables (all optional):
 from __future__ import annotations
 
 import os
+from datetime import datetime as _datetime, timedelta as _timedelta, timezone as _timezone
 
 # -----------------------------------------------------------------------------
 # Project root -- discovered from this file, never hardcoded.
@@ -243,6 +244,72 @@ EXTRACTION_POLL_INTERVAL = int(_env_float("WAGONEYE_EXTRACTION_POLL_INTERVAL", 6
 OCR_ENGINE = _env_str("WAGONEYE_OCR_ENGINE", "rekognition").strip().lower()
 if OCR_ENGINE not in ("rekognition", "easyocr"):
     OCR_ENGINE = "rekognition"
+
+
+# -----------------------------------------------------------------------------
+# OPERATIONAL-DAY DISCOVERY ANCHOR  (the old production rule, adopted verbatim)
+#
+# Everything the pipeline discovers -- raw clips, trimmed clips, resumable
+# manifests -- is bounded by the START OF THE CURRENT OPERATIONAL DAY: 05:00 IST,
+# rolling back a day when the clock is before 05:00.  This is exactly what the
+# previous production processor did:
+#
+#     "Anchor to the current operational day's 5 AM IST start (NOT the moment
+#      this service launched) so a mid-day restart still picks up TODAY's
+#      unprocessed trains instead of skipping everything uploaded before the
+#      restart."
+#
+# Why an anchor beats a sliding "last N minutes" window:
+#   * A restart at any hour still sees the whole operational day, so stopping
+#     overnight and starting at 05:30 loses nothing -- a sliding 10-minute window
+#     would skip every train uploaded while the service was down.
+#   * It is inherently bounded to ONE day, so it can never reach back into months
+#     of archive (the failure that queued 17,600 batches).
+#   * It matches the 05:00 boundary the dashboard already uses for its date
+#     folders (delivery.dashboard_ingest.date_folder), so a train and its report
+#     always agree about which day they belong to.
+#
+# WAGONEYE_PROCESSOR_START_UTC (ISO 8601) raises the anchor for a one-time
+# backlog skip -- never below the 05:00 anchor, and it self-expires at the next
+# day's anchor.  Same semantics as the old PROCESSOR_START_UTC.
+# -----------------------------------------------------------------------------
+
+IST = _timezone(_timedelta(hours=5, minutes=30))
+
+OPERATIONAL_DAY_START_HOUR_IST = int(
+    _env_float("WAGONEYE_OPERATIONAL_DAY_START_HOUR_IST", 5))
+
+
+def operational_day_start_utc(now=None):
+    """UTC datetime of the current operational day's start (05:00 IST default)."""
+    now_utc = now or _datetime.now(_timezone.utc)
+    if getattr(now_utc, "tzinfo", None) is None:
+        now_utc = now_utc.replace(tzinfo=_timezone.utc)
+    now_ist = now_utc.astimezone(IST)
+    start_ist = now_ist.replace(hour=OPERATIONAL_DAY_START_HOUR_IST,
+                                minute=0, second=0, microsecond=0)
+    if now_ist.hour < OPERATIONAL_DAY_START_HOUR_IST:
+        start_ist = start_ist - _timedelta(days=1)
+    return start_ist.astimezone(_timezone.utc)
+
+
+def discovery_cutoff_utc(now=None):
+    """The effective "ignore anything older than this" instant for discovery.
+
+    The operational-day anchor, raised by WAGONEYE_PROCESSOR_START_UTC when that
+    is set and later.  Returns a tz-aware UTC datetime.
+    """
+    anchor = operational_day_start_utc(now)
+    raw = os.getenv("WAGONEYE_PROCESSOR_START_UTC")
+    if raw:
+        try:
+            ov = _datetime.fromisoformat(raw.strip())
+            if ov.tzinfo is None:
+                ov = ov.replace(tzinfo=_timezone.utc)
+            return max(anchor, ov.astimezone(_timezone.utc))
+        except ValueError:
+            pass
+    return anchor
 
 
 # -----------------------------------------------------------------------------

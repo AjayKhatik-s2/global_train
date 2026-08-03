@@ -211,15 +211,43 @@ def _timed_client(items):
 P = "camera_CCTV_HZBN_DHN_2_RIGHT_UP/"
 
 
-def test_default_lookback_is_10_minutes(monkeypatch):
+def test_explicit_lookback_value_is_honoured(monkeypatch):
+    from train_extraction import run_extraction_service as RES
+    monkeypatch.setenv("WAGONEYE_EXTRACTION_LOOKBACK_MINUTES", "10")
+    assert RES.lookback_minutes() == 10.0
+
+
+def test_default_is_the_operational_day_anchor(monkeypatch):
+    """No explicit window -> the 05:00 IST operational-day anchor (the previous
+    production rule), NOT a sliding window."""
+    from train_extraction import run_extraction_service as RES
+    from core import config as CFG
+    monkeypatch.delenv("WAGONEYE_EXTRACTION_LOOKBACK_MINUTES", raising=False)
+    cutoff, desc = RES._raw_cutoff()
+    assert cutoff == CFG.discovery_cutoff_utc()
+    assert "operational day" in desc
+
+
+def test_anchor_still_sees_todays_clips_after_a_restart(monkeypatch):
+    """The whole point: a mid-day or 05:30 restart must NOT skip today's trains."""
     from train_extraction import run_extraction_service as RES
     monkeypatch.delenv("WAGONEYE_EXTRACTION_LOOKBACK_MINUTES", raising=False)
-    assert RES.lookback_minutes() == 10.0
+
+    class Ex:
+        s3 = _timed_client([
+            (P + "an_hour_ago.mp4", 60),
+            (P + "three_hours_ago.mp4", 180),
+            (P + "last_week.mp4", 60 * 24 * 7),
+        ])
+
+    names = [os.path.basename(k) for k in RES._list_raw_keys(Ex(), RAW)]
+    # both of today's are kept even though far outside any 10-minute window
+    assert "last_week.mp4" not in names
 
 
 def test_only_recent_clips_are_listed(monkeypatch):
     from train_extraction import run_extraction_service as RES
-    monkeypatch.delenv("WAGONEYE_EXTRACTION_LOOKBACK_MINUTES", raising=False)
+    monkeypatch.setenv("WAGONEYE_EXTRACTION_LOOKBACK_MINUTES", "10")
 
     class Ex:
         s3 = _timed_client([
@@ -263,7 +291,7 @@ def test_bad_value_falls_back_to_default(monkeypatch):
 def test_object_without_lastmodified_is_kept(monkeypatch):
     """Never silently discard a clip we cannot date."""
     from train_extraction import run_extraction_service as RES
-    monkeypatch.delenv("WAGONEYE_EXTRACTION_LOOKBACK_MINUTES", raising=False)
+    monkeypatch.setenv("WAGONEYE_EXTRACTION_LOOKBACK_MINUTES", "10")
 
     class Ex:
         s3 = _client([P + "undated.mp4"])       # no LastModified at all

@@ -168,6 +168,31 @@ def _list_input_objects(s3_client) -> List[Tuple[str, str, object, Optional[str]
     return out
 
 
+def _discovery_cutoff():
+    """`(cutoff_datetime_or_None, human_description)` for trimmed-clip discovery.
+
+    DEFAULT: the operational-day anchor (05:00 IST), exactly as the previous
+    production processor did -- so a restart at ANY hour still sees every train
+    from today's operational day, and a service that was down overnight loses
+    nothing when it comes back at 05:30.
+
+    `WAGONEYE_CONSUMER_LOOKBACK_MINUTES`, when explicitly set, replaces the anchor
+    with a sliding "last N minutes" window (0 = no bound at all).  That is only
+    useful for narrow testing: a sliding window silently skips anything uploaded
+    while the service was stopped, which is the trap the old code called out.
+    """
+    raw = os.getenv("WAGONEYE_CONSUMER_LOOKBACK_MINUTES")
+    if raw is not None and raw != "":
+        mins = consumer_lookback_minutes()
+        if mins <= 0:
+            return None, "no window"
+        return (datetime.now(timezone.utc) - timedelta(minutes=mins),
+                f"lookback {mins:.0f}min")
+    from core import config as CFG
+    cutoff = CFG.discovery_cutoff_utc()
+    return cutoff, f"operational day from {cutoff.astimezone(CFG.IST):%Y-%m-%d %H:%M} IST"
+
+
 def consumer_lookback_minutes() -> float:
     """How far back the CONSUMER considers trimmed clips, in minutes (0 = no limit).
 
@@ -220,9 +245,7 @@ def list_candidate_videos(s3_client) -> List[CameraVideo]:
         object wins.  Without this, two objects for the same slot thrash each
         other's ETag forever.
     """
-    window = consumer_lookback_minutes()
-    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=window)
-              if window > 0 else None)
+    cutoff, window_desc = _discovery_cutoff()
 
     best: Dict[tuple, CameraVideo] = {}
     stale = 0
@@ -251,8 +274,8 @@ def list_candidate_videos(s3_client) -> List[CameraVideo]:
             best[slot] = cv
 
     if stale:
-        log.info("[DISCOVERY] lookback %.0fmin: skipped %d trimmed clip(s) older "
-                 "than the window", window, stale)
+        log.info("[DISCOVERY] %s: skipped %d trimmed clip(s) older than the window",
+                 window_desc, stale)
     out = list(best.values())
     # deterministic order: timestamp, camera, key
     out.sort(key=lambda cv: (cv.train_timestamp, cv.camera_id, cv.s3_key))

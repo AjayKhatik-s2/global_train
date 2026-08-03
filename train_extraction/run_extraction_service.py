@@ -123,12 +123,11 @@ def _list_raw_keys(ex, raw_bucket: str) -> List[str]:
     vids = [o for o in objs
             if str(o.get("Key", "")).lower().endswith(_VIDEO_EXTS)]
 
-    window = lookback_minutes()
-    if window <= 0:
+    cutoff, window_desc = _raw_cutoff()
+    if cutoff is None:
         return sorted(o["Key"] for o in vids)
 
-    from datetime import datetime, timedelta, timezone
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window)
+    from datetime import timezone
     fresh, stale = [], 0
     for o in vids:
         lm = o.get("LastModified")
@@ -142,9 +141,40 @@ def _list_raw_keys(ex, raw_bucket: str) -> List[str]:
         else:
             stale += 1
     if stale:
-        log.info("lookback %.0fmin: %d of %d raw clip(s) are older than the "
-                 "window and were skipped", window, stale, len(vids))
+        log.info("%s: %d of %d raw clip(s) are older than the window and were "
+                 "skipped", window_desc, stale, len(vids))
     return sorted(fresh)
+
+
+def _raw_cutoff():
+    """`(cutoff_or_None, description)` for raw-clip discovery.
+
+    DEFAULT: the operational-day anchor (05:00 IST) -- the previous production
+    rule, so a restart at any hour still sees today's whole operational day.
+    An explicit WAGONEYE_EXTRACTION_LOOKBACK_MINUTES switches to a sliding window.
+    """
+    from datetime import datetime, timedelta, timezone
+    raw = os.environ.get("WAGONEYE_EXTRACTION_LOOKBACK_MINUTES")
+    if raw is not None and raw != "":
+        mins = lookback_minutes()
+        if mins <= 0:
+            return None, "no window"
+        return (datetime.now(timezone.utc) - timedelta(minutes=mins),
+                f"lookback {mins:.0f}min")
+    try:
+        from core import config as CFG
+        cutoff = CFG.discovery_cutoff_utc()
+        return cutoff, (f"operational day from "
+                        f"{cutoff.astimezone(CFG.IST):%Y-%m-%d %H:%M} IST")
+    except Exception:
+        # Standalone use without the inspection package: fall back to the same
+        # 05:00 IST rule computed locally.
+        ist = timezone(timedelta(hours=5, minutes=30))
+        now_ist = datetime.now(ist)
+        start = now_ist.replace(hour=5, minute=0, second=0, microsecond=0)
+        if now_ist.hour < 5:
+            start -= timedelta(days=1)
+        return start.astimezone(timezone.utc), "operational day (05:00 IST)"
 
 
 def _s3_processed(ex) -> Set[str]:

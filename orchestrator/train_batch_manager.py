@@ -29,7 +29,8 @@ Configuration (all via core.constants, i.e. WAGONEYE_* env overrides):
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 from core import constants as C
@@ -167,26 +168,111 @@ def _list_input_objects(s3_client) -> List[Tuple[str, str, object, Optional[str]
     return out
 
 
+def consumer_lookback_minutes() -> float:
+    """How far back the CONSUMER considers trimmed clips, in minutes (0 = no limit).
+
+    The trimmed bucket holds every clip the extractor has ever produced -- months
+    of them.  Without a bound, a single poll opened a batch for EVERY historical
+    clip (~17,600 on the first production run) and would have tried to inspect the
+    entire archive: weeks of CPU, a full disk, and thousands of emails and
+    dashboard posts.
+
+    Default 60 minutes -- deliberately wider than the extraction window (10 min),
+    because a trimmed clip appears only AFTER its raw footage is cut, and the four
+    cameras arrive minutes apart.  It still must comfortably exceed
+    FINAL_CAMERA_WAIT_MINUTES so a batch's late cameras are still discoverable.
+
+    Set 0 to consider everything (the old behaviour) -- only safe when the
+    terminal-batch set in processed_batches.json genuinely covers the archive.
+    """
+    raw = os.getenv("WAGONEYE_CONSUMER_LOOKBACK_MINUTES")
+    if raw is None or raw == "":
+        return 60.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 60.0
+
+
+#: A clip the extractor could not complete is named `..._train_incomplete.mp4`.
+#: It shares a train timestamp with the real `..._train.mp4`, so both classify to
+#: the same (camera, timestamp) and each poll overwrote the other's ETag --
+#: logging `ETag changed A -> B` then `B -> A` forever and re-triggering a camera
+#: rebuild every tick.  The complete clip always wins.
+_INCOMPLETE_MARKER = "_train_incomplete"
+
+
+def _is_incomplete(key: str) -> bool:
+    return _INCOMPLETE_MARKER in key.rsplit("/", 1)[-1].lower()
+
+
 def list_candidate_videos(s3_client) -> List[CameraVideo]:
     """Classify every discoverable input video into a CameraVideo (camera id +
     train timestamp + ETag).  No clustering -- the manifest scheduler attaches
     each candidate to an active batch (or creates one).  Unclassifiable objects
-    are dropped."""
-    out: List[CameraVideo] = []
+    are dropped.
+
+    Two filters keep this bounded and stable:
+      * a recency window (`consumer_lookback_minutes`), so the whole archive is
+        not re-queued on every poll;
+      * one candidate per (camera, train timestamp) -- a complete `_train.mp4`
+        beats an `_train_incomplete.mp4`, and otherwise the most recently modified
+        object wins.  Without this, two objects for the same slot thrash each
+        other's ETag forever.
+    """
+    window = consumer_lookback_minutes()
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=window)
+              if window > 0 else None)
+
+    best: Dict[tuple, CameraVideo] = {}
+    stale = 0
     for bucket, key, last_modified, etag in _list_input_objects(s3_client):
         cam = _camera_for_key(key)
         ts = parse_train_timestamp(key)
         if not cam or not ts:
             continue
-        out.append(CameraVideo(
+        if cutoff is not None:
+            lm = last_modified
+            if lm is not None:
+                if getattr(lm, "tzinfo", None) is None:
+                    lm = lm.replace(tzinfo=timezone.utc)
+                if lm < cutoff:
+                    stale += 1
+                    continue
+        cv = CameraVideo(
             camera_id=cam, bucket=bucket, s3_key=key,
             filename=key.rsplit("/", 1)[-1],
             s3_url=_https_url(bucket, key),
             train_timestamp=ts, last_modified=last_modified, etag=etag,
-        ))
+        )
+        slot = (cam, ts)
+        prev = best.get(slot)
+        if prev is None or _prefer(cv, prev):
+            best[slot] = cv
+
+    if stale:
+        log.info("[DISCOVERY] lookback %.0fmin: skipped %d trimmed clip(s) older "
+                 "than the window", window, stale)
+    out = list(best.values())
     # deterministic order: timestamp, camera, key
     out.sort(key=lambda cv: (cv.train_timestamp, cv.camera_id, cv.s3_key))
     return out
+
+
+def _prefer(new: CameraVideo, old: CameraVideo) -> bool:
+    """Should `new` replace `old` for the same (camera, train timestamp)?"""
+    new_inc, old_inc = _is_incomplete(new.s3_key), _is_incomplete(old.s3_key)
+    if new_inc != old_inc:
+        return old_inc            # a COMPLETE clip always beats an incomplete one
+    nl, ol = new.last_modified, old.last_modified
+    if nl is not None and ol is not None:
+        if getattr(nl, "tzinfo", None) is None:
+            nl = nl.replace(tzinfo=timezone.utc)
+        if getattr(ol, "tzinfo", None) is None:
+            ol = ol.replace(tzinfo=timezone.utc)
+        if nl != ol:
+            return nl > ol        # newest upload wins
+    return new.s3_key > old.s3_key    # last resort: deterministic, not arbitrary
 
 
 def _ts_to_dt(ts: str) -> Optional[datetime]:

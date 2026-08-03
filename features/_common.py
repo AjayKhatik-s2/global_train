@@ -97,10 +97,16 @@ def precision_kwargs(device: Optional[str] = None, fp16: bool = True) -> Dict[st
 # business logic).  On CPU, batching YOLO across frames amortizes per-call
 # Python/pre/post-processing overhead; using all cores speeds each inference.
 #
-#   WAGONEYE_INFER_BATCH   frames per YOLO batch (default 16 -- benchmarked
-#                          fastest on the door model; 24 best for damage; 32 was
-#                          slower for both).  Set 1 for the exact pre-batch,
-#                          bit-identical single-frame path.
+#   WAGONEYE_INFER_BATCH   frames per YOLO batch (default 24 -- benchmarked
+#                          fastest on CPU for door + damage; 32 was SLOWER for
+#                          both).  Set 1 for the exact pre-batch, bit-identical
+#                          single-frame path.
+#   WAGONEYE_INFER_BATCH_<CAMERA>
+#                          per-camera override, e.g.
+#                          WAGONEYE_INFER_BATCH_RIGHT_UP_TOP=16.  Restores the
+#                          per-camera tuning V4 has as `detection_batch_size` in
+#                          configs/cameras/*.yaml.  Falls back to
+#                          WAGONEYE_INFER_BATCH when unset.
 #   WAGONEYE_TORCH_THREADS intra-op CPU threads (default: all cores).
 #   WAGONEYE_RAW_DETECTIONS bypass post-inference FILTERS (benchmark-only; see
 #                          each processor).  Default False = production behaviour.
@@ -117,6 +123,28 @@ def _env_int(name: str, default: int) -> int:
 
 
 INFER_BATCH = max(1, _env_int("WAGONEYE_INFER_BATCH", 24))
+
+
+def infer_batch_for(camera_id: Optional[str] = None) -> int:
+    """Frames per YOLO batch for `camera_id`.
+
+    ``WAGONEYE_INFER_BATCH_<CAMERA>`` overrides the global
+    ``WAGONEYE_INFER_BATCH`` for one camera -- the equivalent of V4's per-camera
+    ``detection_batch_size`` (configs/cameras/*.yaml).  Read at CALL time, not
+    import time, so it is settable per run without reimporting.
+
+    Batch size is a pure throughput knob: outputs are unchanged except for
+    <=1e-3 px box-coordinate jitter from BLAS reduction order (class + confidence
+    are identical), and ``1`` takes the exact single-frame path.
+    """
+    if camera_id:
+        raw = os.getenv(f"WAGONEYE_INFER_BATCH_{camera_id}")
+        if raw:
+            try:
+                return max(1, int(raw))
+            except ValueError:
+                pass
+    return INFER_BATCH
 RAW_DETECTIONS = os.getenv("WAGONEYE_RAW_DETECTIONS", "").strip().lower() in (
     "1", "true", "yes", "on")
 
@@ -139,14 +167,29 @@ _MODEL_LOCK = threading.Lock()
 
 
 def load_yolo(model_path: str):
-    """Cached YOLO loader.  Returns None if the file is missing -- the
-    caller is expected to short-circuit to NO_DATA in that case.
+    """Cached YOLO loader.  Returns None if the file is missing or unusable --
+    the caller is expected to short-circuit to NO_DATA in that case.
 
     Patches `torch.load` once on first call so .pt weights load on
     torch >= 2.6 (the same monkey-patch used by wagon_count).
     """
     if not model_path or not os.path.isfile(model_path):
         return None
+    # A clone made without git-lfs on PATH leaves a ~130-byte TEXT pointer where
+    # the weights should be.  It passes isfile(), so without this check torch
+    # would fail deep in deserialization with an unhelpful error.  Startup
+    # model_sync is the primary gate; this is the second line of defence.
+    try:
+        from core.model_sync import is_lfs_pointer, lfs_pointer_size
+        if is_lfs_pointer(model_path):
+            size = lfs_pointer_size(model_path)
+            print(f"[MODEL] {model_path} is an UNPULLED GIT-LFS POINTER"
+                  + (f" (expects {size/1e6:.0f} MB)" if size else "")
+                  + " -- run `git lfs pull` (and check git-lfs is on PATH for "
+                    "this user, not just an interactive shell)")
+            return None
+    except Exception:
+        pass
 
     abspath = os.path.abspath(model_path)
     with _MODEL_LOCK:
@@ -350,7 +393,8 @@ def iter_wagon_detections(
     """
     if model is None:
         return
-    b = INFER_BATCH if batch is None else max(1, int(batch))
+    # Per-camera override wins, then the explicit arg, then the global default.
+    b = infer_batch_for(camera_id) if batch is None else max(1, int(batch))
     dev = device if device is not None else DEVICE
     _fp16 = HALF if fp16 is None else bool(fp16)
     prec = precision_kwargs(dev, _fp16)

@@ -49,6 +49,63 @@ log = get_logger("model_sync")
 _AMBIGUOUS_FLAT_FILENAMES = C.AMBIGUOUS_MODEL_FILENAMES
 
 
+# -----------------------------------------------------------------------------
+# Git-LFS pointer detection
+#
+# `.gitattributes` tracks every *.pt with Git LFS.  A clone made without git-lfs
+# on PATH leaves a ~130-byte TEXT stub in place of each model:
+#
+#     version https://git-lfs.github.com/spec/v1
+#     oid sha256:9677c76d...
+#     size 197566809
+#
+# That stub passes `os.path.isfile()`, so a naive existence check reports the
+# model PRESENT and the run then dies deep inside ultralytics with an unhelpful
+# deserialization error.  Detecting it here turns a confusing mid-run crash into
+# a one-line startup message naming the file and the fix.
+# -----------------------------------------------------------------------------
+
+_LFS_MAGIC = b"version https://git-lfs.github.com/spec/v1"
+
+#: No real .pt is anywhere near this small; a pointer is ~130 bytes.
+_LFS_POINTER_MAX_BYTES = 1024
+
+
+def is_lfs_pointer(path: str) -> bool:
+    """True when `path` is an unpulled Git-LFS pointer rather than real weights."""
+    try:
+        if os.path.getsize(path) > _LFS_POINTER_MAX_BYTES:
+            return False
+        with open(path, "rb") as fh:
+            return fh.read(len(_LFS_MAGIC)) == _LFS_MAGIC
+    except OSError:
+        return False
+
+
+def lfs_pointer_size(path: str) -> Optional[int]:
+    """The real byte size a pointer claims, for a more informative message."""
+    try:
+        with open(path, "rb") as fh:
+            for line in fh.read(_LFS_POINTER_MAX_BYTES).splitlines():
+                if line.startswith(b"size "):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _lfs_hint() -> str:
+    """Actionable remedy, naming the PATH trap when git-lfs isn't runnable."""
+    from shutil import which
+    if which("git-lfs") is None:
+        return ("git-lfs is not on PATH -- install it (brew/apt/yum install "
+                "git-lfs) or add its directory to PATH, then run `git lfs pull`. "
+                "NOTE: a git-lfs installed only for an interactive shell (e.g. "
+                "/opt/homebrew/bin) is invisible to systemd/cron, which is the "
+                "usual cause of this.")
+    return "run `git lfs pull` in the repo to fetch the real weights"
+
+
 @dataclass
 class ModelReq:
     category: str          # "reconstruction" | "features" | "extraction"
@@ -79,13 +136,29 @@ class ModelReq:
         return f"s3://{C.MODELS_S3_BUCKET}/{self.s3_key}"
 
     def existing_local(self) -> Optional[str]:
-        """Return a present local path (canonical or legacy), else None."""
-        if os.path.isfile(self.local_path):
-            return self.local_path
+        """Return a present local path (canonical or legacy), else None.
+
+        An unpulled Git-LFS POINTER does not count as present -- see
+        `is_lfs_pointer`.  Returning it here would report the model available and
+        then fail deep inside the model loader.
+        """
+        for path in self.candidate_paths():
+            if os.path.isfile(path) and not is_lfs_pointer(path):
+                return path
+        return None
+
+    def candidate_paths(self) -> List[str]:
+        """Canonical path first, then the accepted legacy name."""
+        paths = [self.local_path]
         if self.legacy:
-            legacy_path = os.path.join(self.local_dir, self.legacy)
-            if os.path.isfile(legacy_path):
-                return legacy_path
+            paths.append(os.path.join(self.local_dir, self.legacy))
+        return paths
+
+    def pointer_path(self) -> Optional[str]:
+        """A candidate that exists but is only an LFS pointer, if any."""
+        for path in self.candidate_paths():
+            if os.path.isfile(path) and is_lfs_pointer(path):
+                return path
         return None
 
     @property
@@ -260,6 +333,17 @@ def verify_and_sync(
         if local:
             report.statuses.append(ModelStatus(req=req, present=True,
                                                local_path=local))
+            continue
+        # An unpulled LFS pointer is NOT a missing object -- downloading over it
+        # from a model bucket would mask a broken checkout, so say what it is.
+        pointer = req.pointer_path()
+        if pointer is not None:
+            size = lfs_pointer_size(pointer)
+            expected = f" (expects {size/1e6:.0f} MB)" if size else ""
+            report.statuses.append(ModelStatus(
+                req=req, present=False, local_path=pointer,
+                error=(f"UNPULLED GIT-LFS POINTER{expected}, not real weights -- "
+                       f"{_lfs_hint()}")))
             continue
         # missing locally
         if not download:

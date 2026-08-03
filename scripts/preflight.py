@@ -132,12 +132,31 @@ def check_models(res: Result, disabled: list, do_sync: bool) -> None:
     from core import model_sync as MS
     from core.feature_config import FeatureConfig
     print(_hdr("\n[4/5] Model availability" + (" + S3 sync" if do_sync else "")))
+
+    # The .pt weights are Git-LFS tracked.  git-lfs installed only for an
+    # interactive shell (e.g. /opt/homebrew/bin, or a login-shell-only PATH) is
+    # INVISIBLE to systemd and cron -- the clone then silently holds ~130-byte
+    # pointer stubs instead of weights.  Check the tool before the files.
+    from shutil import which
+    if which("git-lfs") is None:
+        res.warn("git-lfs not on PATH",
+                 "the *.pt weights are LFS-tracked; if any model below reports "
+                 "UNPULLED GIT-LFS POINTER, install git-lfs for THIS user and "
+                 "run `git lfs pull`")
+    else:
+        print(f"  [{_ok('PASS')}] git-lfs on PATH ({which('git-lfs')})")
+
     enabled = FeatureConfig.from_disabled(disabled).enabled_keys()
     report = MS.verify_and_sync(enabled_features=enabled, download=do_sync)
     for line in report.summary_lines():
         print(line)
+    pointers = [s for s in report.missing
+                if s.error and "GIT-LFS POINTER" in s.error]
+    if pointers:
+        res.check(False, f"{len(pointers)} model(s) are unpulled LFS pointers",
+                  "run `git lfs pull` -- these are text stubs, not weights")
     res.check(report.ok, "all required models present",
-              "" if report.ok else f"{len(report.missing)} missing "
+              "" if report.ok else f"{len(report.missing)} unavailable "
               "(run with --sync once WAGONEYE_MODELS_S3_BUCKET is set, or "
               "`git lfs pull`)")
 

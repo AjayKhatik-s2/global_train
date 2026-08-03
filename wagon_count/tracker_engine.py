@@ -62,6 +62,44 @@ from global_train_state import (
 # GPU behaviour identical (cuda == ultralytics' own default there) while
 # giving a clean CPU fallback on a CPU-only host.
 
+# =============================================================================
+# STAGE-1 DETECTION BATCHING
+# =============================================================================
+#
+# Stage 1 runs the gap detector over EVERY frame of all four full videos -- the
+# single largest CPU cost in a batch, and until now strictly one frame per model
+# call.  Batching the detector amortizes the per-call Python/pre/post overhead
+# the same way `features/_common.iter_wagon_detections` does for Stage 3.
+#
+# DEFAULTS TO 1 (the original, unbatched path) ON PURPOSE.  Stage 1 produces the
+# SEALED CANONICAL wagon count, GW ids and boundaries: everything downstream is
+# keyed off them, and a resealed batch is never renumbered.  CPU batching can
+# shift box coordinates by <=1e-3 px (BLAS reduction order) -- far below any
+# threshold here, but "far below" is a judgement that deserves evidence from real
+# video rather than assumption.  So the fast path is available and off by default;
+# turn it on, compare the wagon count and GW boundaries against a batch=1 run on
+# the same clips, and only then adopt it.
+#
+#   WAGONEYE_STAGE1_INFER_BATCH=1   (default) exact original behaviour
+#   WAGONEYE_STAGE1_INFER_BATCH=16  batched detector, tracking order unchanged
+#
+# Only the raw detector call is batched.  Frames are consumed in strict order, and
+# the class/confidence/height filters, same-frame NMS and sequential Kalman
+# tracking all run per frame exactly as before.
+
+def _stage1_infer_batch() -> int:
+    raw = os.environ.get("WAGONEYE_STAGE1_INFER_BATCH")
+    if not raw:
+        return 1
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 1
+
+
+STAGE1_INFER_BATCH = _stage1_infer_batch()
+
+
 def _resolve_device(force: Optional[str] = None) -> str:
     choice = (force or os.environ.get("WAGONEYE_DEVICE") or "auto").strip().lower()
     if choice in ("cuda", "gpu"):
@@ -308,6 +346,7 @@ class GapTracker:
         self.stats: Dict[str, int] = {}
 
         frame_idx = 0
+        frame_idx_read = 0
         t0 = time.time()
         # Live progress cadence (frames).  Env-overridable so operators can make
         # it chattier/quieter without a code change; default 100.
@@ -317,24 +356,65 @@ class GapTracker:
         except ValueError:
             progress_interval = 100
 
+        # Detection prefetch buffer: (frame, detections) pairs already inferred,
+        # consumed in strict frame order.  Empty and unused when
+        # STAGE1_INFER_BATCH == 1 (the default), in which case the loop below runs
+        # the original one-frame-at-a-time path unchanged.
+        _pending: List[Any] = []
+
+        def _fill_batch() -> None:
+            """Read up to STAGE1_INFER_BATCH analyzable frames and infer as one."""
+            window: List[np.ndarray] = []
+            nonlocal frame_idx_read  # read cursor, ahead of frame_idx when batching
+            while len(window) < STAGE1_INFER_BATCH:
+                if frame_limit and frame_idx_read >= frame_limit:
+                    break
+                if frame_idx_read >= process_hi:
+                    break
+                ok, f = cap.read()
+                if not ok:
+                    break
+                idx = frame_idx_read
+                frame_idx_read += 1
+                if idx < process_lo:
+                    continue            # trimmed head: consumed, not analyzed
+                window.append(f)
+            if window:
+                for f, d in zip(window, self._detect_gaps_batched(window, height)):
+                    _pending.append((f, d))
+
         while True:
-            if frame_limit and frame_idx >= frame_limit:
-                break
-            ret, frame = cap.read()
-            if not ret:
-                break
+            if STAGE1_INFER_BATCH > 1:
+                # ---- batched path (opt-in) ----
+                if not _pending:
+                    _fill_batch()
+                    if not _pending:
+                        break
+                frame, detections = _pending.pop(0)
+                # `frame_idx` still advances one analyzed frame at a time, so gap
+                # events keep their ORIGINAL frame numbers.
+                if frame_idx < process_lo:
+                    frame_idx = process_lo
+            else:
+                # ---- original single-frame path (default, unchanged) ----
+                if frame_limit and frame_idx >= frame_limit:
+                    break
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-            # Stage-1 trim: analyze only [process_lo, process_hi); skip the edge
-            # frames but keep frame_idx advancing so gap events keep ORIGINAL
-            # frame numbers.  Stop once past the trimmed tail (nothing left to
-            # analyze).  With trim=0 this is a no-op (identical prior behaviour).
-            if frame_idx >= process_hi:
-                break
-            if frame_idx < process_lo:
-                frame_idx += 1
-                continue
+                # Stage-1 trim: analyze only [process_lo, process_hi); skip the
+                # edge frames but keep frame_idx advancing so gap events keep
+                # ORIGINAL frame numbers.  Stop once past the trimmed tail
+                # (nothing left to analyze).  With trim=0 this is a no-op
+                # (identical prior behaviour).
+                if frame_idx >= process_hi:
+                    break
+                if frame_idx < process_lo:
+                    frame_idx += 1
+                    continue
 
-            detections = self._detect_gaps(frame, height)
+                detections = self._detect_gaps(frame, height)
 
             if keep_raw_detections and detections:
                 # Lightweight payload for the overlay renderer (bbox + conf)
@@ -520,7 +600,33 @@ class GapTracker:
     # Per-frame YOLO inference
     # ------------------------------------------------------------------
     def _detect_gaps(self, frame: np.ndarray, frame_h: int) -> List[Dict[str, Any]]:
+        """Single-frame detection -- the exact original call path."""
         results = self.model(frame, verbose=False, device=self.device)[0]
+        return self._postprocess_gaps(results, frame_h)
+
+    def _detect_gaps_batched(self, frames: List[np.ndarray],
+                             frame_h: int) -> List[List[Dict[str, Any]]]:
+        """Detect on N frames in ONE model call; return per-frame detection lists.
+
+        Only the raw detector call is batched -- every downstream step (class
+        filter, confidence floor, height filter, same-frame NMS, and the caller's
+        sequential Kalman tracking) is the SAME code applied in the SAME frame
+        order.  Opt-in via WAGONEYE_STAGE1_INFER_BATCH; see the constant's note on
+        why it defaults to 1.
+        """
+        if not frames:
+            return []
+        if len(frames) == 1:
+            return [self._detect_gaps(frames[0], frame_h)]
+        results = self.model(frames, verbose=False, device=self.device)
+        return [self._postprocess_gaps(r, frame_h) for r in results]
+
+    def _postprocess_gaps(self, results, frame_h: int) -> List[Dict[str, Any]]:
+        """Filter one frame's raw YOLO output into gap detections.
+
+        Unchanged from the original inline body -- factored out so the
+        single-frame and batched paths cannot diverge.
+        """
         dets: List[Dict[str, Any]] = []
         if results.boxes is None or len(results.boxes) == 0:
             return dets

@@ -27,3 +27,15 @@ deploy/wagon-eye-extraction.env
 # OS
 .DS_Store
 Thumbs.db
+
+# Model weights fetched from S3 at runtime -- never commit these.
+# The REST of models/ is deliberately tracked via git-lfs (damage.pt,
+# door_state.pt, loaded.pt, the reconstruction set, ...), so this stays narrow
+# rather than ignoring models/**/*.pt and hiding a legitimate new weight file.
+#
+# models/extraction/ holds only the vendored V4 extraction models -- no weights
+# are tracked there, so the whole directory's .pt files are runtime artefacts.
+models/extraction/*.pt
+# The 2-class plate detector (loco_no + wagon_id); its legacy sibling
+# wagon_id_counting.pt IS tracked.
+models/features/wagon_number_update.pt

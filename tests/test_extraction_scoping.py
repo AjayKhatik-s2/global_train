@@ -288,6 +288,61 @@ def test_bad_value_falls_back_to_default(monkeypatch):
     assert RES.lookback_minutes() == 10.0
 
 
+def test_identical_idle_sweeps_log_the_skip_once(monkeypatch, caplog):
+    """An idle feed produced ~11.5k identical lines a day and buried real events."""
+    import logging
+    from train_extraction import run_extraction_service as RES
+    monkeypatch.setenv("WAGONEYE_EXTRACTION_LOOKBACK_MINUTES", "10")
+    RES._LAST_SKIP.clear()
+
+    class Ex:
+        s3 = _timed_client([(P + "now.mp4", 2), (P + "old.mp4", 999)])
+
+    with caplog.at_level(logging.INFO, logger="extraction.service"):
+        for _ in range(5):                      # five identical sweeps
+            RES._list_raw_keys(Ex(), RAW)
+    skips = [r for r in caplog.records if "older than the window" in r.message]
+    assert len(skips) == 1
+
+
+def test_a_changed_skip_count_logs_again(monkeypatch, caplog):
+    """New video (or a day roll) moves the count -- that must NOT be suppressed."""
+    import logging
+    from train_extraction import run_extraction_service as RES
+    monkeypatch.setenv("WAGONEYE_EXTRACTION_LOOKBACK_MINUTES", "10")
+    RES._LAST_SKIP.clear()
+
+    class Ex1:
+        s3 = _timed_client([(P + "old1.mp4", 999)])
+
+    class Ex2:                                   # a second stale clip appears
+        s3 = _timed_client([(P + "old1.mp4", 999), (P + "old2.mp4", 998)])
+
+    with caplog.at_level(logging.INFO, logger="extraction.service"):
+        RES._list_raw_keys(Ex1(), RAW)
+        RES._list_raw_keys(Ex1(), RAW)           # identical -> silent
+        RES._list_raw_keys(Ex2(), RAW)           # changed  -> logs
+    skips = [r for r in caplog.records if "older than the window" in r.message]
+    assert len(skips) == 2
+
+
+def test_each_camera_is_tracked_separately(monkeypatch, caplog):
+    """Four cameras share the process; one going quiet must not mute the others."""
+    import logging
+    from train_extraction import run_extraction_service as RES
+    monkeypatch.setenv("WAGONEYE_EXTRACTION_LOOKBACK_MINUTES", "10")
+    RES._LAST_SKIP.clear()
+
+    class Ex:
+        s3 = _timed_client([(P + "old.mp4", 999)])
+
+    with caplog.at_level(logging.INFO, logger="extraction.service"):
+        RES._list_raw_keys(Ex(), "bucket-a/" + P.rstrip("/"))
+        RES._list_raw_keys(Ex(), "bucket-b/" + P.rstrip("/"))
+    skips = [r for r in caplog.records if "older than the window" in r.message]
+    assert len(skips) == 2                       # one per camera, not deduped away
+
+
 def test_object_without_lastmodified_is_kept(monkeypatch):
     """Never silently discard a clip we cannot date."""
     from train_extraction import run_extraction_service as RES

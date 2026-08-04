@@ -274,12 +274,31 @@ def list_candidate_videos(s3_client) -> List[CameraVideo]:
             best[slot] = cv
 
     if stale:
-        log.info("[DISCOVERY] %s: skipped %d trimmed clip(s) older than the window",
-                 window_desc, stale)
+        _log_discovery_skip_once(window_desc, stale)
     out = list(best.values())
     # deterministic order: timestamp, camera, key
     out.sort(key=lambda cv: (cv.train_timestamp, cv.camera_id, cv.s3_key))
     return out
+
+
+#: Last (window, count) logged, so an idle poll stays silent.  See
+#: `train_extraction.run_extraction_service._log_skip_once` for the rationale.
+_LAST_DISCOVERY_SKIP: list = [None]
+
+
+def _log_discovery_skip_once(window_desc: str, stale: int) -> None:
+    """Log the skip summary only when it CHANGES.
+
+    An idle poll skipped the same 4298 clips every 60s and said so each time.
+    The count moves as soon as a trimmed clip lands or the day rolls, so a real
+    event is never suppressed.  Gates the MESSAGE only, not the filtering.
+    """
+    key = (window_desc, stale)
+    if _LAST_DISCOVERY_SKIP[0] == key:
+        return
+    _LAST_DISCOVERY_SKIP[0] = key
+    log.info("[DISCOVERY] %s: skipped %d trimmed clip(s) older than the window",
+             window_desc, stale)
 
 
 def _prefer(new: CameraVideo, old: CameraVideo) -> bool:

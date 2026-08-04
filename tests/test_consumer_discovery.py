@@ -153,6 +153,26 @@ def test_discovery_is_stable_across_polls(monkeypatch):
     assert len(seen) == 1
 
 
+def test_idle_polls_log_the_skip_once(monkeypatch, caplog):
+    """The idle consumer repeated one identical DISCOVERY line every 60s."""
+    import logging
+    monkeypatch.setenv("WAGONEYE_CONSUMER_LOOKBACK_MINUTES", "10")
+    TBM._LAST_DISCOVERY_SKIP[0] = None
+    s3 = FakeS3([(f"{RU}/{RU}_20260803_120000_train.mp4", 999, "stale")])
+    with caplog.at_level(logging.INFO, logger="wagon_eye.batch_manager"):
+        for _ in range(5):
+            TBM.list_candidate_videos(s3)
+    skips = [r for r in caplog.records if "older than the window" in r.message]
+    assert len(skips) == 1
+    # a changed count is still reported
+    caplog.clear()
+    s3b = FakeS3([(f"{RU}/{RU}_20260803_120000_train.mp4", 999, "stale"),
+                  (f"{RU}/{RU}_20260803_130000_train.mp4", 998, "stale2")])
+    with caplog.at_level(logging.INFO, logger="wagon_eye.batch_manager"):
+        TBM.list_candidate_videos(s3b)
+    assert [r for r in caplog.records if "older than the window" in r.message]
+
+
 def test_different_cameras_and_trains_are_kept_separate(monkeypatch):
     monkeypatch.delenv("WAGONEYE_CONSUMER_LOOKBACK_MINUTES", raising=False)
     s3 = FakeS3([

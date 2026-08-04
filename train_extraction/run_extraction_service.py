@@ -141,9 +141,32 @@ def _list_raw_keys(ex, raw_bucket: str) -> List[str]:
         else:
             stale += 1
     if stale:
-        log.info("%s: %d of %d raw clip(s) are older than the window and were "
-                 "skipped", window_desc, stale, len(vids))
+        _log_skip_once(raw_bucket, window_desc, stale, len(vids))
     return sorted(fresh)
+
+
+#: Last skip-summary logged per raw bucket, so an idle sweep stays silent.
+_LAST_SKIP: Dict[str, tuple] = {}
+
+
+def _log_skip_once(raw_bucket: str, window_desc: str, stale: int,
+                   total: int) -> None:
+    """Log the skip summary only when it CHANGES for this camera.
+
+    With no feed, every 60s sweep skipped an identical ~35k clips and said so --
+    four cameras x 1440 sweeps = ~11.5k identical lines a day, which buries the
+    one line that matters (a train arriving) and fills the disk with nothing.
+
+    The count changes the moment new raw video lands or the operational day
+    rolls, so a real event still logs immediately.  This gates the MESSAGE only;
+    the filtering above is untouched.
+    """
+    key = (window_desc, stale, total)
+    if _LAST_SKIP.get(raw_bucket) == key:
+        return
+    _LAST_SKIP[raw_bucket] = key
+    log.info("%s: %d of %d raw clip(s) are older than the window and were "
+             "skipped", window_desc, stale, total)
 
 
 def _raw_cutoff():

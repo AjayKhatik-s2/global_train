@@ -131,6 +131,32 @@ def test_s3_state_is_folded_into_the_dedup_set(monkeypatch, tmp_path):
     assert extracted == []
 
 
+def test_dedup_summary_is_logged_once_per_camera(monkeypatch, tmp_path, caplog):
+    """`0 local + N from the S3 state store` was identical on every sweep."""
+    import logging
+    from train_extraction import run_extraction_service as RES
+    monkeypatch.setenv("WAGONEYE_EXTRACTION_STATE_DIR", str(tmp_path))
+    RES._LAST_DEDUP.clear()
+
+    class FakeState:
+        processed_videos = set(ALL_CAMERA_KEYS)
+
+    class FakeEx:
+        s3 = _client(ALL_CAMERA_KEYS)
+        state = FakeState()
+
+    monkeypatch.setattr(RES.D, "get_extractor", lambda cam: FakeEx())
+    monkeypatch.setattr(RES.D, "raw_bucket_for", lambda cam: RAW)
+    monkeypatch.setattr(RES.D, "extract_trains", lambda cam, key: [])
+
+    with caplog.at_level(logging.INFO, logger="extraction.service"):
+        for _ in range(4):
+            RES.sweep_camera("RIGHT_UP")
+        RES.sweep_camera("LEFT_UP")             # a different camera still logs
+    dedup = [r for r in caplog.records if "dedup:" in r.message]
+    assert len(dedup) == 2
+
+
 def test_missing_s3_state_degrades_to_local_only(monkeypatch, tmp_path):
     from train_extraction import run_extraction_service as RES
     monkeypatch.setenv("WAGONEYE_EXTRACTION_STATE_DIR", str(tmp_path))

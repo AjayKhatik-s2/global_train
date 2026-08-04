@@ -148,6 +148,9 @@ def _list_raw_keys(ex, raw_bucket: str) -> List[str]:
 #: Last skip-summary logged per raw bucket, so an idle sweep stays silent.
 _LAST_SKIP: Dict[str, tuple] = {}
 
+#: Last dedup summary logged per camera, for the same reason.
+_LAST_DEDUP: Dict[str, tuple] = {}
+
 
 def _log_skip_once(raw_bucket: str, window_desc: str, stale: int,
                    total: int) -> None:
@@ -233,8 +236,13 @@ def sweep_camera(camera: str, *, dry_run: bool = False) -> Dict[str, int]:
         before = len(processed)
         processed |= s3_seen
         if len(processed) > before:
-            log.info("[%s] dedup: %d local + %d from the S3 state store -> %d keys",
-                     camera, before, len(s3_seen), len(processed))
+            # Same reasoning as _log_skip_once: with a dry feed the local ledger
+            # never grows, so this summary is byte-identical every sweep.
+            key = (before, len(s3_seen), len(processed))
+            if _LAST_DEDUP.get(camera) != key:
+                _LAST_DEDUP[camera] = key
+                log.info("[%s] dedup: %d local + %d from the S3 state store -> "
+                         "%d keys", camera, before, len(s3_seen), len(processed))
     keys = _list_raw_keys(ex, raw_bucket)
     result["listed"] = len(keys)
 

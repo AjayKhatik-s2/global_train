@@ -753,10 +753,20 @@ def build_inspection_json(
                 _bump(ptype)
                 problem_frames.append(_problem_frame(
                     wagon_count=wagon_count,
-                    # "wagon" | "engine" | "brakevan" -- a consumer that only
-                    # knows "wagon" can filter on this instead of being handed a
-                    # brake van dressed as a wagon.
-                    segment_type=(internal if non_wagon else "wagon"),
+                    # ALWAYS "wagon" in the problem-frame feed.
+                    #
+                    # A defect is reported against the vehicle that carries it,
+                    # and the dashboard's problem list has only ever shown
+                    # "wagon".  Sending "brakevan"/"engine" here would be more
+                    # precise but risks the receiver ignoring a value it has
+                    # never seen -- and the classification behind it is not
+                    # trustworthy anyway: a wagon whose segment runs into the
+                    # empty track after the rake is confidently mislabelled
+                    # BRAKE_VAN (batch 20260808_125052, GW_59).
+                    #
+                    # The true type is still carried by segment_type_map, so
+                    # nothing is lost -- only the problem feed is normalised.
+                    segment_type="wagon",
                     segment_number=None,        # V4 side leaves this null
                     problem_type=ptype,
                     frame_number=side_meta.get("frame_idx"),

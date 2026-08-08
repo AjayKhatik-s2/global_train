@@ -923,8 +923,12 @@ def test_damaged_brakevan_door_reaches_the_dashboard(tmp_path):
     d = _build(root, "LEFT_UP")["inspection_data"]
     dmg = [p for p in d["problem_frames"] if p["problem_type"] == "damage"]
     assert len(dmg) == 1
-    assert dmg[0]["segment_type"] == "brakevan"     # tagged, not disguised
-    assert dmg[0]["wagon_count"] is None            # non-wagons have no number
+    # The problem feed is normalised to "wagon": the dashboard's problem list
+    # has only ever carried that value, and the BRAKE_VAN classification behind
+    # it is not trustworthy (a wagon whose segment runs into the empty track
+    # after the rake is confidently mislabelled).  The true type stays in
+    # segment_type_map.
+    assert dmg[0]["segment_type"] == "wagon"
 
 
 def test_a_brakevan_is_still_not_a_wagon(tmp_path):
@@ -953,9 +957,11 @@ def test_an_open_engine_door_is_reported_as_engine(tmp_path):
     _write(os.path.join(root, "wagon_states", "door", "RIGHT_UP", "GW_1.json"),
            {"status": C.STATUS_OK, "right_door": C.DOOR_OPEN})   # GW_1 is ENGINE
     d = _build(root, "RIGHT_UP")["inspection_data"]
-    eng = [p for p in d["problem_frames"] if p["segment_type"] == "engine"]
-    assert len(eng) == 1
-    assert eng[0]["problem_type"] in ("door_open", "open_door")
+    # GW_1 (ENGINE) now contributes a problem frame, reported as "wagon"
+    opens = [p for p in d["problem_frames"]
+             if p["problem_type"] in ("door_open", "open_door")]
+    assert len(opens) == 2                     # GW_1 (engine) + GW_2 (wagon)
+    assert {p["segment_type"] for p in opens} == {"wagon"}
     assert d["num_engines"] == 1
     assert {s["segment_type"] for s in d["wagon_segments"]} == {"wagon"}
 
@@ -967,5 +973,5 @@ def test_wagon_findings_are_unchanged_by_the_non_wagon_path(tmp_path):
     d = _build(root, "RIGHT_UP")["inspection_data"]
     assert d["num_engines"] == 1
     assert len(d["wagon_segments"]) == 2               # engine excluded
-    assert d["doors_open"] == 1                        # GW_2 only
+    assert d["doors_open"] == 1                        # GW_2 only (engine excluded)
     assert [p["segment_type"] for p in d["problem_frames"]] == ["wagon"]

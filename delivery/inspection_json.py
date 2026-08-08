@@ -664,12 +664,23 @@ def build_inspection_json(
             seg_id = segment_ids[gw_id]
             internal = internal_types[gw_id]
 
+            # Engines and brake vans are NOT wagons: they never enter
+            # `wagon_segments`, never get a wagon_count, and never move the
+            # wagon statistics -- that is V4's wagon list and it stays exact.
+            #
+            # They ARE still physical vehicles that can carry a defect, though.
+            # Skipping them outright meant a damaged brake-van door was counted
+            # nowhere and emitted nowhere, so the PDF (whose generator has no
+            # such exclusion) showed the finding while the dashboard showed
+            # "NO DAMAGE FOUND" for the same wagon.  Their door state is now
+            # evaluated so a real defect still reaches `problem_frames[]`,
+            # tagged with its own segment_type rather than masquerading as a
+            # wagon.
+            non_wagon = internal in ("engine", "brakevan")
             if internal == "engine":
                 n_engines += 1
-                continue
-            if internal == "brakevan":
+            elif internal == "brakevan":
                 n_brakevans += 1
-                continue
 
             u = _u(gw_id)
             side = "right" if camera == C.CAMERA_RIGHT_UP else "left"
@@ -677,40 +688,45 @@ def build_inspection_json(
                                      u.get(f"{side}_door"))
             door_status = door["door_status"]
             damage_any = door["_damage_from_door"]
+            wagon_count = wagon_count_map[gw_id]      # None for non-wagons
 
-            if damage_any:
-                damaged_wagons += 1
-            if door_status == "open":
-                doors_open += 1
-            elif door_status == "partially_closed":
-                doors_partially_closed += 1
-            else:
-                doors_closed += 1
+            if not non_wagon:
+                if damage_any:
+                    damaged_wagons += 1
+                if door_status == "open":
+                    doors_open += 1
+                elif door_status == "partially_closed":
+                    doors_partially_closed += 1
+                else:
+                    doors_closed += 1
 
-            wagon_count = wagon_count_map[gw_id]
-            seg = {
-                "segment_id": seg_id,
-                "segment_type": "wagon",
-                "wagon_count": wagon_count,
-                "door_status": door_status,
-                "door_close_detected": door["door_close_detected"],
-                "door_partial_detected": door["door_partial_detected"],
-                "damage_detected": damage_any,
-                "wagon_frames": _wagon_frames(evidence_root, gw_id, camera,
-                                              FLAVOUR_SIDE, url_for),
-            }
-            # OCR authority is RIGHT_UP only; LEFT_UP never claims a number.
-            ocr = (_ocr_fields(states_root, evidence_root, gw_id, u, url_for)
-                   if is_ocr_camera
-                   else {"has_result": False, "is_valid_11_digit": False,
-                         "display_number": "-", "is_manipulated": False,
-                         "original_number": "-", "ocr_frame_s3_url": None})
-            if ocr["is_valid_11_digit"]:
-                seg["wagon_number"] = ocr["display_number"]
-                seg["is_valid_wagon_id"] = True
+                seg = {
+                    "segment_id": seg_id,
+                    "segment_type": "wagon",
+                    "wagon_count": wagon_count,
+                    "door_status": door_status,
+                    "door_close_detected": door["door_close_detected"],
+                    "door_partial_detected": door["door_partial_detected"],
+                    "damage_detected": damage_any,
+                    "wagon_frames": _wagon_frames(evidence_root, gw_id, camera,
+                                                  FLAVOUR_SIDE, url_for),
+                }
+                # OCR authority is RIGHT_UP only; LEFT_UP never claims a number.
+                ocr = (_ocr_fields(states_root, evidence_root, gw_id, u, url_for)
+                       if is_ocr_camera
+                       else {"has_result": False, "is_valid_11_digit": False,
+                             "display_number": "-", "is_manipulated": False,
+                             "original_number": "-", "ocr_frame_s3_url": None})
+                if ocr["is_valid_11_digit"]:
+                    seg["wagon_number"] = ocr["display_number"]
+                    seg["is_valid_wagon_id"] = True
+                else:
+                    seg["is_valid_wagon_id"] = False
+                wagon_segments.append(seg)
             else:
-                seg["is_valid_wagon_id"] = False
-            wagon_segments.append(seg)
+                ocr = {"has_result": False, "is_valid_11_digit": False,
+                       "display_number": "-", "is_manipulated": False,
+                       "original_number": "-", "ocr_frame_s3_url": None}
 
             # Every read is emitted (even invalid ones) so a bad OCR attempt is
             # still auditable -- only is_valid_11_digit marks a usable number.
@@ -736,7 +752,11 @@ def build_inspection_json(
             if ptype is not None:
                 _bump(ptype)
                 problem_frames.append(_problem_frame(
-                    wagon_count=wagon_count, segment_type="wagon",
+                    wagon_count=wagon_count,
+                    # "wagon" | "engine" | "brakevan" -- a consumer that only
+                    # knows "wagon" can filter on this instead of being handed a
+                    # brake van dressed as a wagon.
+                    segment_type=(internal if non_wagon else "wagon"),
                     segment_number=None,        # V4 side leaves this null
                     problem_type=ptype,
                     frame_number=side_meta.get("frame_idx"),

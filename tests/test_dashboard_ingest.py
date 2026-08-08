@@ -885,3 +885,87 @@ def test_probable_damage_is_reported_separately(tmp_path, v4):
     assert seg3["floor_dmg_detected"] is False
     assert seg3["damage_detected"] is False
     assert seg3["probable_damage_detected"] is True
+
+
+# -----------------------------------------------------------------------------
+# Non-wagon defects (engine / brake van)
+#
+# Field bug, 2026-08-08: GW_59 was a BRAKE_VAN whose LEFT_UP door came back
+# DAMAGED (two tracks, conf 0.67 / 0.66).  The PDF generator has no non-wagon
+# exclusion so it printed "Left Camera - Damage"; this builder counted engines
+# and brake vans and `continue`d before reading their door state, so the
+# dashboard was told nothing and displayed "NO DAMAGE FOUND" for the same
+# wagon.  Two documents, same batch, opposite answers.
+# -----------------------------------------------------------------------------
+
+def _make_brakevan_batch(root, *, door_state, camera="LEFT_UP"):
+    """The standard fixture, with GW_3 retyped BRAKE_VAN and given a door state."""
+    make_batch(root)
+    p = os.path.join(root, "global_state", "global_train_state.json")
+    with open(p, encoding="utf-8") as f:
+        st = json.load(f)
+    st["wagons"][2]["classification"] = C.CLASS_BRAKE_VAN
+    _write(p, st)
+    u = os.path.join(root, "wagon_states", "unified", "GW_3.json")
+    with open(u, encoding="utf-8") as f:
+        uni = json.load(f)
+    uni["classification"] = C.CLASS_BRAKE_VAN
+    _write(u, uni)
+    side = "right" if camera == C.CAMERA_RIGHT_UP else "left"
+    _write(os.path.join(root, "wagon_states", "door", camera, "GW_3.json"),
+           {"status": C.STATUS_OK, f"{side}_door": door_state})
+    return root
+
+
+def test_damaged_brakevan_door_reaches_the_dashboard(tmp_path):
+    """The exact field case: a damaged brake-van door must not vanish."""
+    root = _make_brakevan_batch(str(tmp_path), door_state=C.DOOR_DAMAGED)
+    d = _build(root, "LEFT_UP")["inspection_data"]
+    dmg = [p for p in d["problem_frames"] if p["problem_type"] == "damage"]
+    assert len(dmg) == 1
+    assert dmg[0]["segment_type"] == "brakevan"     # tagged, not disguised
+    assert dmg[0]["wagon_count"] is None            # non-wagons have no number
+
+
+def test_a_brakevan_is_still_not_a_wagon(tmp_path):
+    """V4's wagon list stays exact: non-wagons never enter wagon_segments."""
+    root = _make_brakevan_batch(str(tmp_path), door_state=C.DOOR_DAMAGED)
+    d = _build(root, "LEFT_UP")["inspection_data"]
+    assert {s["segment_type"] for s in d["wagon_segments"]} == {"wagon"}
+    # the brake van's damage must NOT inflate the wagon statistics
+    assert d["damaged_wagons"] == 0
+    # fixture is ENGINE + WAGON + WAGON; GW_3 retyped -> exactly one wagon left
+    assert d["total_wagons"] == len(d["wagon_segments"]) == 1
+
+
+def test_an_undamaged_brakevan_adds_no_problem_frame(tmp_path):
+    """Only real findings are surfaced -- a closed brake-van door is silent."""
+    root = _make_brakevan_batch(str(tmp_path), door_state=C.DOOR_CLOSED)
+    d = _build(root, "LEFT_UP")["inspection_data"]
+    assert [p for p in d["problem_frames"] if p["problem_type"] == "damage"] == []
+    assert {s["segment_type"] for s in d["wagon_segments"]} == {"wagon"}
+
+
+def test_an_open_engine_door_is_reported_as_engine(tmp_path):
+    """Same rule for the loco end of the rake."""
+    root = str(tmp_path)
+    make_batch(root)
+    _write(os.path.join(root, "wagon_states", "door", "RIGHT_UP", "GW_1.json"),
+           {"status": C.STATUS_OK, "right_door": C.DOOR_OPEN})   # GW_1 is ENGINE
+    d = _build(root, "RIGHT_UP")["inspection_data"]
+    eng = [p for p in d["problem_frames"] if p["segment_type"] == "engine"]
+    assert len(eng) == 1
+    assert eng[0]["problem_type"] in ("door_open", "open_door")
+    assert d["num_engines"] == 1
+    assert {s["segment_type"] for s in d["wagon_segments"]} == {"wagon"}
+
+
+def test_wagon_findings_are_unchanged_by_the_non_wagon_path(tmp_path):
+    """Regression guard: the wagon numbers the dashboard already trusted."""
+    root = str(tmp_path)
+    make_batch(root)
+    d = _build(root, "RIGHT_UP")["inspection_data"]
+    assert d["num_engines"] == 1
+    assert len(d["wagon_segments"]) == 2               # engine excluded
+    assert d["doors_open"] == 1                        # GW_2 only
+    assert [p["segment_type"] for p in d["problem_frames"]] == ["wagon"]

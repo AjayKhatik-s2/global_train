@@ -292,3 +292,72 @@ def test_unparseable_batch_key_is_not_dropped(monkeypatch):
                         BM.BatchManifest.new(batch_key=key, train_timestamp=key))
     got = BM.list_active_manifests(S3(), processed_batches={})
     assert [m.batch_key for m in got] == ["weird-key"]
+
+
+# -----------------------------------------------------------------------------
+# camera resolution -- the site names TOP rigs RIGHT_TOP/LEFT_TOP
+# -----------------------------------------------------------------------------
+
+def test_top_cameras_resolve_from_the_sites_own_naming():
+    """`RIGHT_TOP` contains neither `right_up_top` nor `right_up`.
+
+    Matching basenames against the canonical ids silently dropped both top
+    cameras at discovery: every batch formed with just the two side cameras.
+    """
+    from orchestrator.train_batch_manager import _camera_for_key
+    f = "camera_CCTV_HZBN_DHN_5_RIGHT_TOP"
+    assert _camera_for_key(f"{f}/{f}_20260808_114950_train.mp4") == "RIGHT_UP_TOP"
+    g = "camera_CCTV_HZBN_DHN_6_LEFT_TOP"
+    assert _camera_for_key(f"{g}/{g}_20260808_115052_train.mp4") == "LEFT_UP_TOP"
+
+
+def test_side_cameras_still_resolve():
+    from orchestrator.train_batch_manager import _camera_for_key
+    f = "camera_CCTV_HZBN_DHN_2_RIGHT_UP"
+    assert _camera_for_key(f"{f}/{f}_20260808_114950_train.mp4") == "RIGHT_UP"
+    g = "camera_CCTV_HZBN_DHN_1_LEFT_UP"
+    assert _camera_for_key(f"{g}/{g}_20260808_114954_train.mp4") == "LEFT_UP"
+
+
+def test_a_top_name_is_never_claimed_by_the_shorter_side_token():
+    """`right_up` must not steal a `right_up_top` filename."""
+    from orchestrator.train_batch_manager import _camera_for_key
+    assert _camera_for_key("x/RIGHT_UP_TOP_20260808_120000.mp4") == "RIGHT_UP_TOP"
+    assert _camera_for_key("x/LEFT_UP_TOP_20260808_120000.mp4") == "LEFT_UP_TOP"
+
+
+def test_folder_wins_over_a_mangled_filename():
+    """Real uploads drop the `camera_` prefix and even carry leading spaces."""
+    from orchestrator.train_batch_manager import _camera_for_key
+    assert _camera_for_key(
+        "camera_CCTV_HZBN_DHN_2_RIGHT_UP/  CCTV_HZBN_DHN_2_RIGHT_UP_20260808_115032.mp4"
+    ) == "RIGHT_UP"
+    assert _camera_for_key(
+        "camera_CCTV_HZBN_DHN_6_LEFT_TOP/CCTV_HZBN_DHN_6_LEFT_TOP_20260808_115052.mp4"
+    ) == "LEFT_UP_TOP"
+
+
+def test_non_video_and_unknown_keys_are_still_rejected():
+    from orchestrator.train_batch_manager import _camera_for_key
+    assert _camera_for_key("camera_CCTV_HZBN_DHN_2_RIGHT_UP/notes.txt") is None
+    assert _camera_for_key("some/other/clip_20260808_120000.mp4") is None
+
+
+def test_local_scan_accepts_the_sites_top_naming(tmp_path):
+    """No hand-renaming needed before a --local-only run."""
+    from core.batch import scan_local_video_dir
+    for n in ("camera_CCTV_HZBN_DHN_2_RIGHT_UP_20260808_120000.mp4",
+              "camera_CCTV_HZBN_DHN_1_LEFT_UP_20260808_120000.mp4",
+              "camera_CCTV_HZBN_DHN_5_RIGHT_TOP_20260808_120000.mp4",
+              "camera_CCTV_HZBN_DHN_6_LEFT_TOP_20260808_120000.mp4"):
+        (tmp_path / n).write_bytes(b"x")
+    found = scan_local_video_dir(str(tmp_path))
+    assert set(found) == {"RIGHT_UP", "LEFT_UP", "RIGHT_UP_TOP", "LEFT_UP_TOP"}
+
+
+def test_local_scan_still_accepts_canonical_names(tmp_path):
+    from core.batch import scan_local_video_dir
+    for n in ("RIGHT_UP.mp4", "LEFT_UP.mp4", "RIGHT_UP_TOP.mp4", "LEFT_UP_TOP.mp4"):
+        (tmp_path / n).write_bytes(b"x")
+    found = scan_local_video_dir(str(tmp_path))
+    assert set(found) == {"RIGHT_UP", "LEFT_UP", "RIGHT_UP_TOP", "LEFT_UP_TOP"}

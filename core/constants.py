@@ -318,6 +318,49 @@ CAMERA_S3_FOLDER = {
     CAMERA_LEFT_UP_TOP:  "camera_CCTV_HZBN_DHN_6_LEFT_TOP",
 }
 
+#: Reverse lookup: S3 folder -> camera id.  The folder is AUTHORITATIVE, because
+#: the rig writes it; a filename is whatever the uploader felt like.
+S3_FOLDER_TO_CAMERA = {v: k for k, v in CAMERA_S3_FOLDER.items()}
+
+#: Filename tokens that identify a camera, for keys whose folder is unknown.
+#:
+#: The site names its TOP rigs `RIGHT_TOP` / `LEFT_TOP` (see CAMERA_S3_FOLDER
+#: above) but the canonical camera ids are RIGHT_UP_TOP / LEFT_UP_TOP.  Matching
+#: only on the canonical id silently failed for both top cameras: their clips
+#: resolved to no camera at all, were dropped at discovery, and every batch
+#: formed with just the two side cameras -- no top load classification, no top
+#: damage, and reports missing half the rig.
+#:
+#: Order matters at match time: LONGEST token first, so a `..._RIGHT_UP_TOP_...`
+#: name is not claimed by the shorter `right_up`.
+CAMERA_FILENAME_TOKENS = {
+    "right_up_top": CAMERA_RIGHT_UP_TOP,
+    "left_up_top":  CAMERA_LEFT_UP_TOP,
+    "right_top":    CAMERA_RIGHT_UP_TOP,
+    "left_top":     CAMERA_LEFT_UP_TOP,
+    "right_up":     CAMERA_RIGHT_UP,
+    "left_up":      CAMERA_LEFT_UP,
+}
+
+
+def camera_from_key(key: str):
+    """Resolve a camera id from an S3 key (or a bare filename).  None if unknown.
+
+    Folder first (the rig writes it), then filename tokens.  Shared by S3
+    discovery and the local-directory scan so the two can never disagree.
+    """
+    if not key:
+        return None
+    k = key.replace("\\", "/")
+    for folder, cam in S3_FOLDER_TO_CAMERA.items():
+        if f"/{folder}/" in f"/{k}" or k.startswith(f"{folder}/"):
+            return cam
+    base = k.rsplit("/", 1)[-1].lower()
+    for token in sorted(CAMERA_FILENAME_TOKENS, key=len, reverse=True):
+        if token in base:
+            return CAMERA_FILENAME_TOKENS[token]
+    return None
+
 # Reports / evidence / archive (V4: inspection_output_bucket).
 S3_OUTPUT_BUCKET = _env("WAGONEYE_S3_OUTPUT_BUCKET", "biro-wagon-report-biro-copy")
 S3_TRAIN_BATCH_PREFIX = _env("WAGONEYE_S3_TRAIN_BATCH_PREFIX", "train_batch")

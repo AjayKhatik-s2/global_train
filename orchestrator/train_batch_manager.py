@@ -106,18 +106,18 @@ def save_batch_state(s3_client, state_loc: str, processed: Dict[str, str]) -> No
 # -----------------------------------------------------------------------------
 
 def _camera_for_key(key: str) -> Optional[str]:
-    """Match an S3 key's basename to a camera id by substring.
+    """Resolve an S3 key to a camera id.
 
-    Longest camera name first so RIGHT_UP_TOP wins over RIGHT_UP -- identical
-    disambiguation to core.batch.scan_local_video_dir.
+    Delegates to `constants.camera_from_key`, which checks the camera FOLDER
+    first and only then filename tokens.  Basename-only matching against the
+    canonical ids used to drop both TOP cameras on the floor: the site writes
+    `RIGHT_TOP`/`LEFT_TOP`, which contains neither `right_up_top` nor
+    `right_up`, so those clips resolved to no camera and never joined a batch.
     """
     base = key.rsplit("/", 1)[-1].lower()
     if not base.endswith(_VIDEO_EXTS):
         return None
-    for cam in sorted(C.ALL_CAMERAS, key=len, reverse=True):
-        if cam.lower() in base:
-            return cam
-    return None
+    return C.camera_from_key(key)
 
 
 def _clean_etag(raw) -> Optional[str]:

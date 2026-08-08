@@ -119,11 +119,14 @@ def scan_local_video_dir(local_dir: str) -> Dict[str, str]:
     candidates = sorted(set(candidates))
 
     found: Dict[str, str] = {}
-    # Longest camera name first so RIGHT_UP_TOP wins over RIGHT_UP
-    for cam in sorted(C.ALL_CAMERAS, key=len, reverse=True):
-        cam_l = cam.lower()
-        for path in candidates:
-            if cam_l in os.path.basename(path).lower() and path not in found.values():
-                found[cam] = path
-                break
+    # Resolve through the shared token map so the site's own naming works here
+    # too: a file called `..._RIGHT_TOP_...` is RIGHT_UP_TOP.  Matching only the
+    # canonical ids meant top-camera clips had to be renamed by hand before a
+    # local run would see them.
+    for path in candidates:
+        if path in found.values():
+            continue
+        cam = C.camera_from_key(os.path.basename(path))
+        if cam and cam not in found:
+            found[cam] = path
     return found

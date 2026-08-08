@@ -100,6 +100,45 @@ def _stage1_infer_batch() -> int:
 STAGE1_INFER_BATCH = _stage1_infer_batch()
 
 
+# -----------------------------------------------------------------------------
+# Last-segment head sampling
+# -----------------------------------------------------------------------------
+#
+# The FINAL segment has no closing gap -- it runs to the end of the video.  The
+# trimmed clip deliberately keeps a few seconds after the rake has passed (the
+# extractor's END_EXTRA_BUFFER, needed so a real brake van is never cut off), so
+# that segment is "vehicle, then empty track".
+#
+# Classifying it by sampling evenly across the whole span therefore votes mostly
+# on grass.  Observed on batch 20260808_125052: GW_59 spanned 182 frames of
+# which ~45 held a wagon and ~137 were empty track; all three cameras returned
+# BRAKE_VAN at >=0.99 confidence for what was actually a wagon.
+#
+# The vehicle always sits at the START of that segment (gap -> vehicle -> empty
+# track), so classify it from the head of the span.  A rake that genuinely ends
+# with a brake van still reads BRAKE_VAN -- its head shows a brake van.
+#
+# ONLY the last segment, and NEVER when the last is also the first: a phantom
+# leading segment can be DROPPED when it classifies UNKNOWN
+# (global_alignment.build_global_wagons), and this must not be able to influence
+# that decision.  Segment count, boundaries and numbering are untouched -- this
+# changes a LABEL, never how many vehicles exist.
+#
+# WAGONEYE_STAGE1_LAST_SEGMENT_HEAD: fraction of the last segment to classify
+# from (default 0.35).  0 or >=1 disables it and restores the previous
+# whole-span sampling exactly.
+
+def _last_segment_head_fraction() -> float:
+    raw = os.environ.get("WAGONEYE_STAGE1_LAST_SEGMENT_HEAD")
+    if raw is None or raw.strip() == "":
+        return 0.35
+    try:
+        v = float(raw)
+    except ValueError:
+        return 0.35
+    return v if 0.0 < v < 1.0 else 0.0      # out of range == disabled
+
+
 def _resolve_device(force: Optional[str] = None) -> str:
     choice = (force or os.environ.get("WAGONEYE_DEVICE") or "auto").strip().lower()
     if choice in ("cuda", "gpu"):
@@ -815,16 +854,35 @@ class MasterClassifier:
         self,
         video_path: str,
         segments: List[Tuple[int, int]],
+        last_segment_head_fraction: Optional[float] = None,
     ) -> List[_MasterClassification]:
-        """Classify each (start_frame, end_frame) segment of `video_path`."""
+        """Classify each (start_frame, end_frame) segment of `video_path`.
+
+        The LAST segment (when it is not also the first) is classified from the
+        head of its span -- see `_last_segment_head_fraction` for why.
+        """
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video for classification: {video_path}")
 
+        head = (_last_segment_head_fraction()
+                if last_segment_head_fraction is None
+                else float(last_segment_head_fraction))
+        n = len(segments)
+
         out: List[_MasterClassification] = []
         try:
             for idx, (sf, ef) in enumerate(segments):
-                label, conf = self._classify_one(cap, sf, ef)
+                # last, and never the first -- the leading segment feeds the
+                # phantom-drop guard and must be classified exactly as before.
+                is_last_only = (idx == n - 1 and idx != 0)
+                frac = head if (is_last_only and 0.0 < head < 1.0) else None
+                if frac is not None and self.verbose:
+                    kept = max(1, int(round((ef - sf + 1) * frac)))
+                    print(f"[Classify/{self.tag}] last segment {sf}-{ef}: "
+                          f"classifying from the first {kept} frame(s) "
+                          f"({frac:.0%}) -- the tail is post-rake empty track")
+                label, conf = self._classify_one(cap, sf, ef, head_fraction=frac)
                 seg_class = self._label_to_class(label, conf)
                 out.append(_MasterClassification(
                     segment_index=idx,
@@ -846,7 +904,14 @@ class MasterClassifier:
         cap: cv2.VideoCapture,
         start_frame: int,
         end_frame: int,
+        *,
+        head_fraction: Optional[float] = None,
     ) -> Tuple[str, float]:
+        # Narrow to the head of the span BEFORE the usual 10% margin, so the
+        # margin still trims the edges of the window we actually sample.
+        if head_fraction is not None and 0.0 < head_fraction < 1.0:
+            full = max(1, end_frame - start_frame + 1)
+            end_frame = start_frame + max(0, int(round(full * head_fraction)) - 1)
         span = max(1, end_frame - start_frame + 1)
         margin = max(1, int(span * 0.1))
         safe_s = start_frame + margin

@@ -419,3 +419,81 @@ def test_side_gap_model_mapping_is_shared():
     assert RGC._SIDE_GAP_MODEL[C.CAMERA_RIGHT_UP] == "right_up_wagon_gap.pt"
     assert RGC._SIDE_GAP_MODEL[C.CAMERA_LEFT_UP] == "left_up_wagon_gap.pt"
     assert RGC._gap_model_for.__module__ == RGC.__name__
+
+
+# -----------------------------------------------------------------------------
+# Stage-3 throughput knobs (opt-in; sequential remains the default)
+# -----------------------------------------------------------------------------
+
+def test_stage3_is_sequential_unless_opted_in(monkeypatch):
+    from orchestrator import feature_scheduler as FS
+    monkeypatch.delenv("WAGONEYE_STAGE3_WAGON_WORKERS", raising=False)
+    assert FS.wagon_workers() == 1
+
+
+def test_stage3_workers_are_configurable(monkeypatch):
+    from orchestrator import feature_scheduler as FS
+    monkeypatch.setenv("WAGONEYE_STAGE3_WAGON_WORKERS", "4")
+    assert FS.wagon_workers() == 4
+    monkeypatch.setenv("WAGONEYE_STAGE3_WAGON_WORKERS", "auto")
+    assert 1 <= FS.wagon_workers() <= 4          # capped: workers drive torch threads
+    monkeypatch.setenv("WAGONEYE_STAGE3_WAGON_WORKERS", "nonsense")
+    assert FS.wagon_workers() == 1               # bad value -> safe default
+
+
+def test_torch_threads_untouched_unless_set(monkeypatch):
+    """An existing deployment must not silently change behaviour."""
+    from features import _common as FC
+    monkeypatch.delenv("WAGONEYE_TORCH_THREADS", raising=False)
+    assert FC._apply_torch_threads() is None
+    monkeypatch.setenv("WAGONEYE_TORCH_THREADS", "nonsense")
+    assert FC._apply_torch_threads() is None
+
+
+def test_model_cache_is_shared_sequentially_and_per_thread_in_parallel(monkeypatch):
+    """Two threads must never share one ultralytics model instance.
+
+    ultralytics keeps predictor/results state on the object, so a shared
+    instance under concurrency corrupts results SILENTLY -- wrong detections,
+    not a crash.
+    """
+    import threading
+    from features import _common as FC
+    monkeypatch.delenv("_WAGONEYE_PARALLEL_MODELS", raising=False)
+    assert FC.parallel_models_enabled() is False
+    monkeypatch.setenv("_WAGONEYE_PARALLEL_MODELS", "1")
+    assert FC.parallel_models_enabled() is True
+
+    # the cache key must differ per thread only when parallel is on
+    seen = []
+
+    def _key():
+        return (("/m.pt", threading.get_ident() if FC.parallel_models_enabled() else 0))
+
+    t = threading.Thread(target=lambda: seen.append(_key()))
+    t.start(); t.join()
+    assert seen[0] != _key()                     # different threads -> different keys
+    monkeypatch.delenv("_WAGONEYE_PARALLEL_MODELS", raising=False)
+    seen.clear()
+    t = threading.Thread(target=lambda: seen.append(_key()))
+    t.start(); t.join()
+    assert seen[0] == _key()                     # sequential -> one shared instance
+
+
+def test_parallel_preserves_feature_order_within_a_wagon():
+    """LOAD must still precede DAMAGE -- the floor filter depends on it."""
+    import inspect
+    from orchestrator import feature_scheduler as FS
+    assert FS.WAGON_FEATURE_ORDER == ("load", "damage", "door", "ocr")
+    src = inspect.getsource(FS.run_features_wagon_wise)
+    # the per-wagon body iterates `active` in order; only wagons are parallel
+    assert "for feat in active:" in src
+    assert "pool.map(_one_wagon, state.wagons)" in src
+
+
+def test_parallel_merges_results_in_wagon_order():
+    """Summary must not depend on which wagon finishes first."""
+    import inspect
+    from orchestrator import feature_scheduler as FS
+    src = inspect.getsource(FS.run_features_wagon_wise)
+    assert "for i, (gwid, per_feat, ran, errs) in enumerate(results, start=1)" in src

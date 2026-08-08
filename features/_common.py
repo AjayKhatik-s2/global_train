@@ -47,6 +47,43 @@ HALF = CFG.use_half_precision(DEVICE)
 
 
 # -----------------------------------------------------------------------------
+# CPU thread budget
+# -----------------------------------------------------------------------------
+#
+# Nothing in this pipeline ever configured torch's thread count, so on a CPU box
+# it ran at whatever default torch picked.  Measured on the 16-vCPU production
+# host during a real batch: ~3.3 cores busy out of 16.
+#
+# WAGONEYE_TORCH_THREADS sets it explicitly.  Unset => leave torch's default
+# ALONE, so this cannot change the behaviour of an existing deployment; set it
+# to a number (or "auto" for os.cpu_count()) to opt in.
+#
+# NOTE: more threads is not free.  YOLO on CPU does not scale linearly, and when
+# frame loading (JPEG decode) is the real bottleneck, extra threads mostly idle.
+# Measure a real batch before and after rather than assuming a speedup.
+
+def _apply_torch_threads() -> Optional[int]:
+    raw = (os.getenv("WAGONEYE_TORCH_THREADS") or "").strip().lower()
+    if not raw:
+        return None
+    try:
+        n = os.cpu_count() or 1 if raw == "auto" else int(raw)
+    except ValueError:
+        return None
+    if n < 1:
+        return None
+    try:
+        import torch
+        torch.set_num_threads(n)
+        return n
+    except Exception:
+        return None
+
+
+TORCH_THREADS = _apply_torch_threads()
+
+
+# -----------------------------------------------------------------------------
 # FP16 precision selection -- migrated OFF the deprecated ultralytics `half=`
 # predict argument.  Newer ultralytics deprecates `half` in favour of `quantize`
 # ("'half' is deprecated ... Use 'quantize' instead").
@@ -162,8 +199,19 @@ except Exception:
 # YOLO loader cache
 # -----------------------------------------------------------------------------
 
-_MODEL_CACHE: Dict[str, Any] = {}
+#: Keyed by (abspath, thread_ident) -- thread_ident is 0 unless wagon-level
+#: parallelism is on, so the sequential path keeps exactly one instance.
+_MODEL_CACHE: Dict[Any, Any] = {}
 _MODEL_LOCK = threading.Lock()
+
+
+def parallel_models_enabled() -> bool:
+    """True when Stage 3 runs wagons concurrently and models must be per-thread.
+
+    Read live (not cached) so the scheduler can turn it on for the duration of a
+    parallel run and off again afterwards.
+    """
+    return bool(os.environ.get("_WAGONEYE_PARALLEL_MODELS"))
 
 
 def load_yolo(model_path: str):
@@ -192,8 +240,14 @@ def load_yolo(model_path: str):
         pass
 
     abspath = os.path.abspath(model_path)
+    # One YOLO instance PER THREAD when wagons run in parallel.  ultralytics
+    # keeps predictor/results state on the model object, so two threads calling
+    # model(frame) concurrently can corrupt each other's results -- silently, as
+    # wrong detections rather than a crash.  Sequential mode (the default) keeps
+    # the single shared instance and is byte-for-byte unchanged.
+    key = (abspath, threading.get_ident() if parallel_models_enabled() else 0)
     with _MODEL_LOCK:
-        cached = _MODEL_CACHE.get(abspath)
+        cached = _MODEL_CACHE.get(key)
         if cached is not None:
             return cached
 
@@ -207,7 +261,7 @@ def load_yolo(model_path: str):
 
         from ultralytics import YOLO
         model = YOLO(abspath)
-        _MODEL_CACHE[abspath] = model
+        _MODEL_CACHE[key] = model
         return model
 
 

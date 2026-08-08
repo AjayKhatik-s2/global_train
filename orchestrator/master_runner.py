@@ -653,6 +653,9 @@ def _attach_candidate(cv, actives, processed, ctx, tolerance_sec):
     new_slot = BM.CameraSlot(
         camera_id=cv.camera_id, bucket=cv.bucket, s3_key=cv.s3_key, etag=cv.etag,
         filename=cv.filename, s3_url=cv.s3_url,
+        # Size is part of the object identity that incremental gap extraction
+        # uses to decide "same object" vs "replacement video".
+        file_size=int(getattr(cv, "file_size", 0) or 0),
         last_modified=(cv.last_modified.isoformat() if cv.last_modified
                        and hasattr(cv.last_modified, "isoformat") else None),
     )

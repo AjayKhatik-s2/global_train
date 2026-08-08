@@ -129,6 +129,48 @@ class GapEvent:
             "bbox_history": [[round(float(v), 2) for v in b] for b in self.bbox_history],
         }
 
+    # -- lossless round-trip (per-camera gap cache) ---------------------------
+    #
+    # `to_dict` is the PUBLIC report shape (per_camera_tracking.json) and is
+    # deliberately lossy: it drops `center_x_trajectory` and `fps`, and rounds.
+    # The cache pair below is a strict superset used only to rebuild an
+    # identical in-memory GapEvent, so a cached camera is indistinguishable
+    # from one that was just inferred.  to_dict is NOT touched -- the public
+    # JSON stays byte-identical.
+
+    def to_cache_dict(self) -> Dict[str, Any]:
+        return {
+            "track_id": self.track_id,
+            "camera_id": self.camera_id,
+            "start_frame": self.start_frame,
+            "end_frame": self.end_frame,
+            "confidence": self.confidence,
+            "hit_count": self.hit_count,
+            "center_x_trajectory": [float(v) for v in self.center_x_trajectory],
+            "fps": self.fps,
+            "temporal_consistency_score": self.temporal_consistency_score,
+            "hit_frames": [int(f) for f in self.hit_frames],
+            "bbox_history": [[float(v) for v in b] for b in self.bbox_history],
+            "class_label": self.class_label,
+        }
+
+    @classmethod
+    def from_cache_dict(cls, d: Dict[str, Any]) -> "GapEvent":
+        return cls(
+            track_id=int(d["track_id"]),
+            camera_id=str(d["camera_id"]),
+            start_frame=int(d["start_frame"]),
+            end_frame=int(d["end_frame"]),
+            confidence=float(d["confidence"]),
+            hit_count=int(d["hit_count"]),
+            center_x_trajectory=[float(v) for v in d.get("center_x_trajectory", [])],
+            fps=float(d.get("fps", 0.0)),
+            temporal_consistency_score=float(d.get("temporal_consistency_score", 0.0)),
+            hit_frames=[int(f) for f in d.get("hit_frames", [])],
+            bbox_history=[[float(v) for v in b] for b in d.get("bbox_history", [])],
+            class_label=str(d.get("class_label", "gap")),
+        )
+
 
 # =============================================================================
 # LOCAL CAMERA TRACKS
@@ -155,6 +197,26 @@ class _MasterClassification:
             "end_frame": self.end_frame,
             "label": self.label,
             "confidence": round(self.confidence, 4),
+        }
+
+    @classmethod
+    def from_cache_dict(cls, d: Dict[str, Any]) -> "_MasterClassification":
+        """Unrounded round-trip for the per-camera gap cache."""
+        return cls(
+            segment_index=int(d["segment_index"]),
+            start_frame=int(d["start_frame"]),
+            end_frame=int(d["end_frame"]),
+            label=str(d["label"]),
+            confidence=float(d["confidence"]),
+        )
+
+    def to_cache_dict(self) -> Dict[str, Any]:
+        return {
+            "segment_index": self.segment_index,
+            "start_frame": self.start_frame,
+            "end_frame": self.end_frame,
+            "label": self.label,
+            "confidence": self.confidence,
         }
 
 
@@ -201,6 +263,47 @@ class LocalCameraTracks:
         if include_classifications and self.classifications:
             out["classifications"] = [c.to_dict() for c in self.classifications]
         return out
+
+    # -- lossless round-trip (per-camera gap cache) ---------------------------
+
+    def to_cache_dict(self) -> Dict[str, Any]:
+        """Everything needed to rebuild this object exactly.
+
+        Superset of `to_dict`: adds the unrounded gap fields and
+        `raw_frame_detections`, which `to_dict` drops but the Stage-1 overlay
+        renderer (`video_segmenter.render_processed_video`) reads to draw raw
+        candidate boxes.  Without it a cached camera would render a *different*
+        debug overlay than a freshly-inferred one.
+        """
+        return {
+            "camera_id": self.camera_id,
+            "video_path": self.video_path,
+            "fps": self.fps,
+            "total_frames": self.total_frames,
+            "width": self.width,
+            "height": self.height,
+            "gaps": [g.to_cache_dict() for g in self.gaps],
+            "classifications": [c.to_cache_dict() for c in self.classifications],
+            # JSON object keys must be strings; restored to int on load.
+            "raw_frame_detections": {str(k): v for k, v
+                                     in self.raw_frame_detections.items()},
+        }
+
+    @classmethod
+    def from_cache_dict(cls, d: Dict[str, Any]) -> "LocalCameraTracks":
+        raw = d.get("raw_frame_detections") or {}
+        return cls(
+            camera_id=str(d["camera_id"]),
+            video_path=str(d.get("video_path", "")),
+            fps=float(d["fps"]),
+            total_frames=int(d["total_frames"]),
+            width=int(d.get("width", 0)),
+            height=int(d.get("height", 0)),
+            gaps=[GapEvent.from_cache_dict(g) for g in d.get("gaps", [])],
+            classifications=[_MasterClassification.from_cache_dict(c)
+                             for c in d.get("classifications", [])],
+            raw_frame_detections={int(k): v for k, v in raw.items()},
+        )
 
 
 # =============================================================================

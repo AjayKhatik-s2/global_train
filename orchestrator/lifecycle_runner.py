@@ -36,6 +36,7 @@ from core.lifecycle import ArrivalState, LifecycleState, is_terminal
 from core.logging_setup import get_logger
 
 from orchestrator import batch_manifest as BM
+from orchestrator import gap_extraction as GX
 from orchestrator.batch_manifest import BatchManifest, CameraSlot
 
 log = get_logger("lifecycle")
@@ -141,6 +142,17 @@ def stage_seal(manifest: BatchManifest, ctx: RunContext, *, master_camera: str) 
     video_paths = _download_present(manifest, ctx)
     present = list(video_paths.keys())
     fallback = (master_camera != C.MASTER_CAMERA)
+
+    # Consume whatever per-camera gap results incremental extraction already
+    # produced.  Cameras without a cached result are inferred inside the
+    # subprocess exactly as before, so a partly-populated cache is safe.
+    gap_cache_dir = None
+    if GX.enabled():
+        gap_cache_dir = GX.cache_dir(root)
+        ready = GX.readiness(manifest, gap_cache_dir)
+        log.info("[AUTO/GLOBAL] Building Global Train from persisted gap results: %s",
+                 " ".join(f"{c}={ready[c]}" for c in C.ALL_CAMERAS))
+
     log.info("[SEAL %s] reconstructing: master=%s present=%s fallback=%s",
              manifest.batch_key, master_camera, present, fallback)
 
@@ -153,6 +165,7 @@ def stage_seal(manifest: BatchManifest, ctx: RunContext, *, master_camera: str) 
             master_camera=master_camera,
             allow_fallback_master=fallback,
             verbose=ctx.verbose,
+            gap_cache_dir=gap_cache_dir,
         )
     except reconstruction_runner.ReconstructionError as e:
         log.error("[SEAL %s] reconstruction failed: %s", manifest.batch_key, e)
@@ -732,6 +745,20 @@ def advance(manifest: BatchManifest, ctx: RunContext) -> BatchManifest:
         # ---- pre-seal ----
         if st in (LifecycleState.DISCOVERED, LifecycleState.COLLECTING_CAMERAS,
                   LifecycleState.WAITING_FOR_MASTER, LifecycleState.WAITING_FOR_SUPPORT):
+            # Per-camera gap extraction runs BEFORE the seal decision, so a
+            # camera that is already here never waits for the others.  This is
+            # preparation only -- it cannot seal, and it does not influence the
+            # seal trigger evaluated below, which keeps its existing policy.
+            if GX.enabled() and not manifest.global_state_version:
+                try:
+                    GX.extract_ready_cameras(manifest, ctx,
+                                             batch_root(ctx, manifest.batch_key))
+                    _persist(manifest, ctx)     # slot.local_path may have been set
+                except Exception as e:
+                    log.error("[AUTO/GAP %s] incremental extraction pass failed: "
+                              "%s -- seal will infer in-process instead",
+                              manifest.batch_key, e, exc_info=True)
+
             master = _choose_master(manifest)
             if master == C.MASTER_CAMERA:
                 # RIGHT_UP present: wait for the short support window (unless all

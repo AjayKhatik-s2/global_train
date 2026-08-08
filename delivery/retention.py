@@ -43,7 +43,10 @@ from core.logging_setup import get_logger
 log = get_logger("delivery.retention")
 
 #: Batch subdirectories that exist ONLY on local disk (never uploaded to S3).
-LOCAL_ONLY_SUBDIRS = (CFG.DIR_WAGON_CACHE, CFG.DIR_DOWNLOADS, CFG.DIR_ARCHIVE)
+#: `gap_cache` holds the per-camera Stage-1 results consumed at seal time; once
+#: the batch is finalized the sealed GlobalTrainState supersedes them.
+LOCAL_ONLY_SUBDIRS = (CFG.DIR_WAGON_CACHE, CFG.DIR_DOWNLOADS, CFG.DIR_ARCHIVE,
+                      "gap_cache")
 
 
 def _env_bool(name: str, default: bool) -> bool:

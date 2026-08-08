@@ -20,6 +20,7 @@ for marking the batch as `failed_no_global_state` when this raises.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -105,6 +106,107 @@ def _write_trace(output_dir: str, cmd: list, returncode: int,
         log.warning("[STAGE1] could not write stage1 trace file: %s", e)
 
 
+def run_camera_gaps(
+    *,
+    camera_id: str,
+    video_path: str,
+    reconstruction_models_dir: str,
+    gap_cache_dir: str,
+    repo_root: str,
+    source_identity: Optional[Dict[str, object]] = None,
+    master_camera: str = C.MASTER_CAMERA,
+    python_executable: Optional[str] = None,
+    timeout_seconds: int = 3600,
+    verbose: bool = True,
+) -> int:
+    """Gap-extract ONE camera into `gap_cache_dir`.  Returns the exit code.
+
+    Invokes the same `run_global_count.py` in `--camera-only` mode, so gap
+    detection, tracking, NMS/merge and the per-camera classification are the
+    existing implementations -- there is no second detector.  Produces NO
+    GlobalTrainState: assembly stays in `run()` below.
+
+    Never raises for a processing failure; the caller isolates failures per
+    camera and retries on a later tick.
+    """
+    if camera_id not in _CAM_FLAG:
+        log.error("[GAP] unknown camera %s", camera_id)
+        return 4
+    if not os.path.exists(video_path):
+        log.error("[GAP] %s video does not exist: %s", camera_id, video_path)
+        return 4
+
+    wagon_count_dir = _find_wagon_count_dir(repo_root)
+    os.makedirs(gap_cache_dir, exist_ok=True)
+
+    cmd = [python_executable or sys.executable,
+           os.path.join(wagon_count_dir, "run_global_count.py"),
+           _CAM_FLAG[camera_id], video_path,
+           "--camera-only", camera_id,
+           "--gap-cache", gap_cache_dir,
+           "--models-dir", reconstruction_models_dir,
+           # --master-camera tells the child whether THIS camera owns the
+           # pre-fusion classification pass; it selects no master here.
+           "--master-camera", master_camera]
+    if source_identity is not None:
+        cmd += ["--source-identity", json.dumps(source_identity)]
+
+    log.info("[AUTO/GAP] Starting %s gap extraction", camera_id)
+    t0 = time.time()
+    rc, captured = _stream_subprocess(cmd, wagon_count_dir, timeout_seconds,
+                                      verbose, tag=f"GAP:{camera_id}")
+    elapsed = time.time() - t0
+    if rc != 0:
+        if captured:
+            log.error("[AUTO/GAP] %s failed (exit=%s) --- output tail ---\n%s",
+                      camera_id, rc, "\n".join(captured[-30:]))
+        else:
+            log.error("[AUTO/GAP] %s failed (exit=%s)", camera_id, rc)
+        return rc if isinstance(rc, int) else 3
+    log.info("[AUTO/GAP] %s gap extraction subprocess OK (%.1fs)",
+             camera_id, elapsed)
+    return 0
+
+
+def _stream_subprocess(cmd: list, cwd: str, timeout_seconds: int,
+                       verbose: bool, *, tag: str):
+    """Run `cmd`, relaying each child line to the log as it is printed.
+
+    Returns `(returncode_or_None, captured_lines)`; None means it timed out and
+    was killed.  Shared by the per-camera and full Stage-1 invocations so both
+    stream identically.
+    """
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    captured: List[str] = []
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, env=env,
+    )
+
+    def _pump() -> None:
+        try:
+            for raw in proc.stdout:
+                line = raw.rstrip("\n")
+                captured.append(line)
+                if verbose and line:
+                    log.info("[%s] %s", tag, line)
+        except Exception:                               # pragma: no cover
+            pass
+
+    reader = threading.Thread(target=_pump, name=f"{tag}-log-pump", daemon=True)
+    reader.start()
+    try:
+        proc.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        reader.join(timeout=5)
+        log.error("[%s] timed out after %ds", tag, timeout_seconds)
+        return None, captured
+    reader.join(timeout=10)
+    return proc.returncode, captured
+
+
 def run(
     *,
     video_paths: Dict[str, str],
@@ -116,6 +218,7 @@ def run(
     python_executable: Optional[str] = None,
     timeout_seconds: int = 7200,
     verbose: bool = True,
+    gap_cache_dir: Optional[str] = None,
 ) -> ReconstructionResult:
     """Run Stage 1 over the PRESENT cameras (master-first, subset-capable).
 
@@ -169,6 +272,10 @@ def run(
         "--no-frames",      # materializer owns frame extraction
         # wagon_count's tracking overlay videos are kept (no --no-videos).
     ]
+    # AUTO only: consume per-camera gap results already extracted incrementally.
+    # Omitted by LOCAL mode, which therefore always infers in-process as before.
+    if gap_cache_dir:
+        cmd += ["--gap-cache", gap_cache_dir]
 
     if verbose:
         log.info("[STAGE1] launching wagon_count: %s", " ".join(cmd))

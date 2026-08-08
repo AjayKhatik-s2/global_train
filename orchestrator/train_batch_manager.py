@@ -127,9 +127,12 @@ def _clean_etag(raw) -> Optional[str]:
     return str(raw).strip().strip('"')
 
 
-def _list_input_objects(s3_client) -> List[Tuple[str, str, object, Optional[str]]]:
-    """Return [(bucket, key, last_modified, etag), ...] for every video under
-    the configured input prefixes.  Handles pagination."""
+def _list_input_objects(s3_client) -> List[Tuple[str, str, object, Optional[str], int]]:
+    """Return [(bucket, key, last_modified, etag, size), ...] for every video
+    under the configured input prefixes.  Handles pagination.
+
+    `size` is carried so incremental gap extraction can use it as a second
+    object-identity signal alongside the ETag."""
     global _WARNED_NO_PREFIXES
     prefixes = C.S3_INPUT_PREFIXES
     bucket = C.S3_INPUT_BUCKET
@@ -141,7 +144,7 @@ def _list_input_objects(s3_client) -> List[Tuple[str, str, object, Optional[str]
             _WARNED_NO_PREFIXES = True
         return []
 
-    out: List[Tuple[str, str, object, Optional[str]]] = []
+    out: List[Tuple[str, str, object, Optional[str], int]] = []
     for prefix in prefixes:
         token = None
         while True:
@@ -158,7 +161,8 @@ def _list_input_objects(s3_client) -> List[Tuple[str, str, object, Optional[str]
                 key = item["Key"]
                 if key.lower().endswith(_VIDEO_EXTS):
                     out.append((bucket, key, item.get("LastModified"),
-                                _clean_etag(item.get("ETag"))))
+                                _clean_etag(item.get("ETag")),
+                                int(item.get("Size") or 0)))
             if resp.get("IsTruncated"):
                 token = resp.get("NextContinuationToken")
                 if not token:
@@ -249,7 +253,7 @@ def list_candidate_videos(s3_client) -> List[CameraVideo]:
 
     best: Dict[tuple, CameraVideo] = {}
     stale = 0
-    for bucket, key, last_modified, etag in _list_input_objects(s3_client):
+    for bucket, key, last_modified, etag, size in _list_input_objects(s3_client):
         cam = _camera_for_key(key)
         ts = parse_train_timestamp(key)
         if not cam or not ts:
@@ -267,6 +271,7 @@ def list_candidate_videos(s3_client) -> List[CameraVideo]:
             filename=key.rsplit("/", 1)[-1],
             s3_url=_https_url(bucket, key),
             train_timestamp=ts, last_modified=last_modified, etag=etag,
+            file_size=size,
         )
         slot = (cam, ts)
         prev = best.get(slot)

@@ -85,6 +85,7 @@ from global_train_state import (
 from tracker_engine import GapTracker, MasterClassifier, segments_from_gaps
 import global_alignment as ga
 import video_segmenter as vs
+import gap_cache as gc
 
 
 # =============================================================================
@@ -246,14 +247,42 @@ def _classify_top_regions(
     are converted top->master via the shared-t=0 timebase so the labels line up
     with each GlobalWagon's master-frame window in ``fuse_semantic_labels``.
     """
+    local = _classify_top_local(top_tracks, top_classification_model_path,
+                                num_samples, verbose)
+    return _rescale_top_to_master(local, top_fps=top_tracks.fps,
+                                  master_fps=master_fps)
+
+
+def _classify_top_local(
+    top_tracks: LocalCameraTracks,
+    top_classification_model_path: str,
+    num_samples: int,
+    verbose: bool,
+) -> List[_MasterClassification]:
+    """The inference half of `_classify_top_regions`, in the top camera's OWN frames.
+
+    Split out so incremental per-camera extraction can run it the moment that
+    top camera arrives -- the rescale below needs the MASTER's fps, which is
+    unknown while cameras are still landing.
+    """
     segs = segments_from_gaps(top_tracks.gaps, top_tracks.total_frames)
     if not segs:
         return []
     clf = MasterClassifier(top_classification_model_path, num_samples=num_samples,
                            verbose=verbose, tag=f"TOP:{top_tracks.camera_id}")
-    local = clf.classify_segments(top_tracks.video_path, segs)   # top-frame ranges
-    top_fps = top_tracks.fps if top_tracks.fps > 0 else master_fps
-    scale = (master_fps / top_fps) if top_fps > 0 else 1.0
+    return clf.classify_segments(top_tracks.video_path, segs)   # top-frame ranges
+
+
+def _rescale_top_to_master(
+    local: List[_MasterClassification], *, top_fps: float, master_fps: float,
+) -> List[_MasterClassification]:
+    """The arithmetic half: top frames -> master frames via the shared t=0 timebase.
+
+    Identical to the expression this was extracted from; deferred so it can be
+    applied at assembly time to a cached top camera.
+    """
+    fps = top_fps if top_fps > 0 else master_fps
+    scale = (master_fps / fps) if fps > 0 else 1.0
     return [_MasterClassification(
         segment_index=c.segment_index,
         start_frame=int(round(c.start_frame * scale)),
@@ -261,6 +290,151 @@ def _classify_top_regions(
         label=c.label,
         confidence=c.confidence,
     ) for c in local]
+
+
+# =============================================================================
+# Incremental per-camera gap extraction (AUTO/S3 only)
+# =============================================================================
+
+#: Per-side-camera gap model. Module level so the full run and the incremental
+#: per-camera run cannot drift apart on model selection.
+_SIDE_GAP_MODEL = {
+    CAMERA_RIGHT_UP: "right_up_wagon_gap.pt",
+    CAMERA_LEFT_UP:  "left_up_wagon_gap.pt",
+}
+
+
+def _gap_model_for(camera_id: str, models_dir: str) -> str:
+    """The SAME model selection the full run uses -- one source of truth."""
+    if camera_id in (CAMERA_RIGHT_UP_TOP, CAMERA_LEFT_UP_TOP):
+        return _resolve_model("top_gap.pt", models_dir)
+    return _resolve_model(_SIDE_GAP_MODEL[camera_id], models_dir)
+
+
+def _extract_one_camera(
+    camera_id: str, video_path: str, args, verbose: bool,
+) -> tuple:
+    """Gap-extract ONE camera by calling the existing Stage-1 code paths.
+
+    Returns `(tracks, master_classifications, top_local_classifications)`.
+
+    This deliberately contains no detection, tracking, NMS, merge or
+    ownership logic of its own -- it dispatches to `_process_side_camera` /
+    `_process_top_camera` / `_classify_master_pre_fusion` /
+    `_classify_top_local`, the very functions the full run calls, so there is
+    exactly one implementation of gap detection in the repository.
+    """
+    keep_raw = not args.no_raw_detections
+    gap_model = _gap_model_for(camera_id, args.models_dir)
+
+    if camera_id in (CAMERA_RIGHT_UP_TOP, CAMERA_LEFT_UP_TOP):
+        tracks = _process_top_camera(
+            camera_id, video_path, gap_model,
+            confidence=args.top_confidence,
+            min_height_ratio=args.top_min_height_ratio,
+            keep_raw_detections=keep_raw, verbose=verbose,
+        )
+    else:
+        tracks = _process_side_camera(
+            camera_id, video_path, gap_model,
+            confidence=args.side_confidence,
+            min_height_ratio=args.side_min_height_ratio,
+            keep_raw_detections=keep_raw, verbose=verbose,
+        )
+
+    # The master's own pre-fusion classification depends only on its own video
+    # and its own gaps, so it belongs to this camera's work.
+    master_cls: List[_MasterClassification] = []
+    if camera_id == args.master_camera:
+        try:
+            master_cls = _classify_master_pre_fusion(
+                tracks, _resolve_model("side_classification.pt", args.models_dir),
+                num_samples=args.classification_samples, verbose=verbose)
+        except Exception as e:
+            print(f"WARNING: master classification failed: {e}", file=sys.stderr)
+
+    # Top semantic evidence, in this camera's OWN frames (rescaled at assembly).
+    top_local: List[_MasterClassification] = []
+    if camera_id in TOP_CAMERAS:
+        try:
+            top_local = _classify_top_local(
+                tracks, _resolve_model("top_classification.pt", args.models_dir),
+                num_samples=args.classification_samples, verbose=verbose)
+        except FileNotFoundError:
+            print("[STAGE1] top_classification.pt absent; top semantic evidence "
+                  "skipped for this camera")
+        except Exception as e:
+            print(f"WARNING: top classification failed for {camera_id}: {e}",
+                  file=sys.stderr)
+
+    return tracks, master_cls, top_local
+
+
+def _run_camera_only(args, verbose: bool) -> int:
+    """`--camera-only CAM`: extract + persist one camera's gaps, then exit.
+
+    Produces NO GlobalTrainState and performs no fusion -- calling this once
+    per camera must never assemble a Global Train.  Assembly stays in the
+    normal (non-camera-only) path, gated by the caller's existing policy.
+    """
+    camera_id = args.camera_only
+    if not args.gap_cache:
+        print("ERROR: --camera-only requires --gap-cache", file=sys.stderr)
+        return 4
+
+    explicit = {
+        CAMERA_RIGHT_UP:     args.right_up,
+        CAMERA_LEFT_UP:      args.left_up,
+        CAMERA_RIGHT_UP_TOP: args.right_up_top,
+        CAMERA_LEFT_UP_TOP:  args.left_up_top,
+    }[camera_id]
+    video_path = _resolve_optional_input(explicit, args.inputs_dir, camera_id)
+    if not video_path:
+        print(f"ERROR: no video for {camera_id}", file=sys.stderr)
+        return 4
+
+    identity = None
+    if args.source_identity:
+        try:
+            identity = json.loads(args.source_identity)
+        except (ValueError, TypeError) as e:
+            print(f"ERROR: --source-identity is not valid JSON: {e}", file=sys.stderr)
+            return 4
+
+    os.makedirs(args.gap_cache, exist_ok=True)
+    print("=" * 70)
+    print(f"  WAGON EYE - PER-CAMERA GAP EXTRACTION ({camera_id})")
+    print("=" * 70)
+    print(f"  video      : {video_path}")
+    print(f"  gap cache  : {args.gap_cache}")
+
+    gc.write_state(args.gap_cache, camera_id, gc.GapState.PROCESSING,
+                   identity, updated_at=_utc_now_iso())
+    t0 = time.time()
+    try:
+        tracks, master_cls, top_local = _extract_one_camera(
+            camera_id, video_path, args, verbose)
+    except Exception as e:
+        traceback.print_exc()
+        gc.write_state(args.gap_cache, camera_id, gc.GapState.FAILED, identity,
+                       error=f"{type(e).__name__}: {e}", updated_at=_utc_now_iso())
+        print(f"ERROR: gap extraction failed for {camera_id}: {e}", file=sys.stderr)
+        return 3
+
+    # The master's classifications ride along inside LocalCameraTracks, exactly
+    # as the full run attaches them before fusion.
+    if master_cls:
+        tracks.classifications = master_cls
+
+    gc.write_result(args.gap_cache, camera_id, tracks, identity=identity,
+                    top_local_classifications=top_local,
+                    produced_at=_utc_now_iso())
+    gc.write_state(args.gap_cache, camera_id, gc.GapState.COMPLETED, identity,
+                   gap_count=len(tracks.gaps), updated_at=_utc_now_iso())
+    print(f"[GAP] {camera_id} complete: gaps={len(tracks.gaps)} "
+          f"wagons={tracks.local_wagon_count} fps={tracks.fps:.2f} "
+          f"frames={tracks.total_frames} in {time.time() - t0:.1f}s")
+    return 0
 
 
 # =============================================================================
@@ -341,6 +515,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-raw-detections", action="store_true",
                    help="Don't keep raw per-frame detections in memory (saves RAM)")
     p.add_argument("--quiet", action="store_true", help="Reduce log verbosity")
+
+    # ---- incremental per-camera gap extraction (AUTO/S3 pipeline only) ----
+    #
+    # Omit BOTH of these and this script behaves exactly as it always has:
+    # every present camera is inferred in-process, then fused.  LOCAL mode
+    # never passes them.
+    p.add_argument("--gap-cache", default=None, metavar="DIR",
+                   help="Directory of per-camera gap results. In normal mode, a "
+                        "camera whose cached result matches its source object is "
+                        "LOADED instead of re-inferred.")
+    p.add_argument("--camera-only", default=None, choices=list(ALL_CAMERAS),
+                   help="Run gap extraction for THIS camera only, write its result "
+                        "into --gap-cache, and exit. Performs no fusion and "
+                        "produces no GlobalTrainState.")
+    p.add_argument("--source-identity", default=None, metavar="JSON",
+                   help="JSON object identifying the S3 source (bucket/key/etag/"
+                        "size/last_modified) recorded with a --camera-only result "
+                        "so a replaced video is never mistaken for a cache hit.")
+
     p.add_argument("--stage1-debug", action="store_true",
                    help="Debug visualization: overlay the raw per-frame candidate "
                         "detections (cyan) on top of the final tracked gaps in the "
@@ -363,6 +556,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.stage1_frame_trim_percent is not None:
         os.environ["WAGONEYE_STAGE1_FRAME_TRIM_PERCENT"] = str(
             args.stage1_frame_trim_percent)
+
+    # Per-camera preparation mode: extract + persist ONE camera, no assembly.
+    if args.camera_only:
+        return _run_camera_only(args, verbose)
 
     t_start = time.time()
     print("=" * 70)
@@ -395,11 +592,8 @@ def main(argv: Optional[List[str]] = None) -> int:
               file=sys.stderr)
         return 4
 
-    # Resolve only the models the present cameras need.
-    _SIDE_GAP_MODEL = {
-        CAMERA_RIGHT_UP: "right_up_wagon_gap.pt",
-        CAMERA_LEFT_UP:  "left_up_wagon_gap.pt",
-    }
+    # Resolve only the models the present cameras need (_SIDE_GAP_MODEL is
+    # module level so --camera-only picks the identical weights).
     try:
         gap_model: Dict[str, str] = {}
         need_top = any(c in present_videos for c in (CAMERA_RIGHT_UP_TOP, CAMERA_LEFT_UP_TOP))
@@ -444,10 +638,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("  STEP 1  Per-camera gap tracking")
     print("-" * 70)
     tracks: Dict[str, LocalCameraTracks] = {}
+    # Top cameras' own-frame semantic labels, loaded from cache when available;
+    # rescaled to master frames in STEP 2b once the master's fps is known.
+    cached_top_local: Dict[str, List[_MasterClassification]] = {}
     try:
         for cam in ALL_CAMERAS:
             if cam not in present_videos:
                 continue
+            # A camera already gap-extracted incrementally is LOADED, not
+            # re-inferred.  Identity is not re-checked here: the caller only
+            # populates the cache dir for the exact objects in this batch, and
+            # it verified the match before scheduling extraction.
+            if args.gap_cache:
+                cached, tops = gc.load_tracks(args.gap_cache, cam)
+                if cached is not None:
+                    # The cached video_path came from the extraction run; point
+                    # it at this run's copy so overlay rendering still opens it.
+                    cached.video_path = present_videos[cam]
+                    tracks[cam] = cached
+                    if tops:
+                        cached_top_local[cam] = tops
+                    print(f"[STEP1] {cam}: loaded {len(cached.gaps)} gap(s) from "
+                          f"cache (no re-inference)")
+                    continue
             if cam in (CAMERA_RIGHT_UP_TOP, CAMERA_LEFT_UP_TOP):
                 tracks[cam] = _process_top_camera(
                     cam, present_videos[cam], gap_model[cam],
@@ -484,15 +697,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  STEP 2  {master_cam} master classification (ENGINE / WAGON / BRAKE_VAN)")
     print("-" * 70)
     master = tracks[master_cam]
-    try:
-        initial_classifications = _classify_master_pre_fusion(
-            master, side_cls_path,
-            num_samples=args.classification_samples, verbose=verbose,
-        )
-    except Exception as e:
-        print(f"WARNING: master classification failed: {e}", file=sys.stderr)
-        traceback.print_exc()
-        initial_classifications = []
+    if master.classifications:
+        # Produced during this master's incremental extraction and restored with
+        # its tracks -- re-running would spend the same inference twice.
+        initial_classifications = list(master.classifications)
+        print(f"[STEP2] loaded {len(initial_classifications)} pre-fusion "
+              f"classification(s) from cache (no re-inference)")
+    else:
+        try:
+            initial_classifications = _classify_master_pre_fusion(
+                master, side_cls_path,
+                num_samples=args.classification_samples, verbose=verbose,
+            )
+        except Exception as e:
+            print(f"WARNING: master classification failed: {e}", file=sys.stderr)
+            traceback.print_exc()
+            initial_classifications = []
 
     # ------------------------------------------------------------------
     # STEP 2b -- TOP-camera semantic classification (top_classification.pt)
@@ -500,6 +720,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Runs only when the model is present (on EC2); skipped gracefully locally.
     # ------------------------------------------------------------------
     top_classifications: Dict[str, List[_MasterClassification]] = {}
+    # Cached top cameras only need the frame rescale -- the inference already
+    # happened when that camera arrived.  Same arithmetic, same result.
+    for cam, local in cached_top_local.items():
+        if cam in tracks:
+            top_classifications[cam] = _rescale_top_to_master(
+                local, top_fps=tracks[cam].fps, master_fps=tracks[master_cam].fps)
+            print(f"[STEP2b] {cam}: rescaled {len(local)} cached top "
+                  f"classification(s) to master frames (no re-inference)")
     try:
         top_cls_path = _resolve_model("top_classification.pt", args.models_dir)
     except FileNotFoundError:
@@ -510,7 +738,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("  STEP 2b  Top-camera classification (top_classification.pt)")
         print("-" * 70)
         for cam in TOP_CAMERAS:
-            if cam not in tracks:
+            if cam not in tracks or cam in top_classifications:
                 continue
             try:
                 top_classifications[cam] = _classify_top_regions(
@@ -521,7 +749,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             except Exception as e:
                 print(f"WARNING: top classification failed for {cam}: {e}",
                       file=sys.stderr)
-    else:
+    elif not top_classifications:
         print("[STAGE1] top_classification.pt not found in models dir; "
               "top semantic evidence disabled (gap-only classification).")
 

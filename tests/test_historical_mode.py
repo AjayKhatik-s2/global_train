@@ -589,8 +589,11 @@ def test_live_discovery_module_still_behaves_identically():
     assert TBM.consumer_lookback_minutes() == 60.0
     cutoff, desc = TBM._discovery_cutoff()
     assert cutoff is not None and "operational day" in desc
-    # historical reuses these helpers read-only; they are the live ones
-    assert HR.cluster_into_batches.__defaults__[0] == TBM.DEFAULT_BATCH_TOLERANCE_SEC
+    # historical reuses these helpers read-only; they are the live ones, and it
+    # DEFAULTS to the live clustering tolerance (only --tolerance-sec widens it)
+    assert (HR.cluster_into_batches.__kwdefaults__["tolerance_sec"]
+            == TBM.DEFAULT_BATCH_TOLERANCE_SEC)
+    assert HR.select_objects.__kwdefaults__["tolerance_sec"] == 120
 
 
 def _run_all():
@@ -738,3 +741,52 @@ def test_successful_batch_reclaims_the_wagon_cache():
     failed = go(C.BATCH_REPORT_FAILED, False)
     assert failed[CFG.DIR_WAGON_CACHE] is True, "a failed batch keeps its cache"
     assert failed[CFG.DIR_DOWNLOADS] is True
+
+
+def test_tolerance_widening_reunites_a_split_train():
+    """Real 2026-08-01 shape: the four cameras' clips for ONE train are stamped
+    up to ~5 min apart, so the live 120s tolerance splits them into fragments."""
+    objs = [_obj(C.CAMERA_RIGHT_UP_TOP, "20260801_085436"),
+            _obj(C.CAMERA_LEFT_UP_TOP, "20260801_085609"),   # +93s
+            _obj(C.CAMERA_RIGHT_UP, "20260801_085758"),      # +109s
+            _obj(C.CAMERA_LEFT_UP, "20260801_085919")]       # +81s  (283s total)
+    win = _window(date="2026-08-01", start="05:30", end="18:00")
+
+    # live tolerance: chained gaps are each < 120s, so they now stay together
+    tight = _discover(objs, window=win, pad=15.0)
+    assert len(tight.batches) == 1 and tight.batches[0].is_complete()
+
+    # a genuine 10-minute gap is still a DIFFERENT train at any sane tolerance
+    objs2 = objs + [_obj(C.CAMERA_RIGHT_UP, "20260801_091000")]
+    two = _discover(objs2, window=win, pad=15.0)
+    assert len(two.batches) == 2, [b.batch_key for b in two.batches]
+
+    # explicit widening is plumbed through and recorded in the manifest
+    wide = HR.select_objects(s3_client=FakeS3(objs), window=win,
+                             pad_minutes=15.0, tolerance_sec=600)
+    assert wide.tolerance_sec == 600
+    man = HR.build_manifest(wide, workspace_root="/w", dry_run=True)
+    assert man["clustering"] == {"tolerance_sec": 600, "live_default_sec": 120}
+
+
+def test_cluster_anchor_chains_from_the_latest_member():
+    """Anchoring on the FIRST clip capped a train's total span at the tolerance;
+    chaining from the latest lets a 4-camera train span more than that, while
+    each successive gap is still bounded."""
+    from core.batch import CameraVideo as CV
+
+    def cv(cam, ts):
+        return CV(camera_id=cam, bucket="b", s3_key=_key(cam, ts),
+                  filename="f", s3_url="", train_timestamp=ts)
+
+    chained = [cv(C.CAMERA_RIGHT_UP, "20260801_120000"),
+               cv(C.CAMERA_LEFT_UP, "20260801_120130"),      # +90s
+               cv(C.CAMERA_RIGHT_UP_TOP, "20260801_120300"),  # +90s
+               cv(C.CAMERA_LEFT_UP_TOP, "20260801_120430")]   # +90s (270s span)
+    got = HR.cluster_into_batches(chained, tolerance_sec=120)
+    assert len(got) == 1 and got[0].is_complete()
+
+    # a single gap ABOVE the tolerance still splits
+    split = chained[:2] + [cv(C.CAMERA_RIGHT_UP_TOP, "20260801_121000")]
+    got2 = HR.cluster_into_batches(split, tolerance_sec=120)
+    assert len(got2) == 2

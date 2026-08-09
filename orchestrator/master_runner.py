@@ -861,6 +861,7 @@ def run_historical(args, *, feature_config=None) -> int:
     `processed_batches.json` state file is neither read nor written.
     """
     from orchestrator import historical_runner as HR
+    from orchestrator import train_batch_manager as TBM
 
     try:
         window = HR.resolve_window(
@@ -887,6 +888,8 @@ def run_historical(args, *, feature_config=None) -> int:
         feature_config=feature_config,
         pad_minutes=(HR.DEFAULT_PAD_MINUTES if args.pad_minutes is None
                      else args.pad_minutes),
+        tolerance_sec=(TBM.DEFAULT_BATCH_TOLERANCE_SEC
+                       if args.tolerance_sec is None else args.tolerance_sec),
         dry_run=args.dry_run,
         keep_inputs=args.keep_inputs,
         deliver=args.historical_deliver,
@@ -965,6 +968,11 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="ISO-8601 start, e.g. 2026-08-08T10:00:00+05:30 "
                            "(alternative to --date/--start-time)")
     hist.add_argument("--end", default=None, help="ISO-8601 end")
+    hist.add_argument("--tolerance-sec", type=int, default=None,
+                      help="seconds between two cameras' clips for them to be "
+                           "the same train (default 120, the live value).  Some "
+                           "days stamp the four cameras minutes apart -- check "
+                           "--dry-run and widen if batches come out partial")
     hist.add_argument("--pad-minutes", type=float, default=None,
                       help="how far past its filename timestamp a clip may still "
                            "hold its train (default 15)")

@@ -261,10 +261,12 @@ class DiscoveryResult:
     selected: List[SelectedObject] = field(default_factory=list)
     batches: List[TrainBatch] = field(default_factory=list)
     duplicates_dropped: int = 0
+    tolerance_sec: int = TBM.DEFAULT_BATCH_TOLERANCE_SEC
 
 
 def select_objects(
     *, s3_client, window: HistoricalWindow, pad_minutes: float = DEFAULT_PAD_MINUTES,
+    tolerance_sec: int = TBM.DEFAULT_BATCH_TOLERANCE_SEC,
 ) -> DiscoveryResult:
     """List the configured input prefixes and keep the clips whose coverage
     window overlaps the requested range.
@@ -335,12 +337,14 @@ def select_objects(
     ordered = sorted(best_cv.values(),
                      key=lambda cv: (cv.train_timestamp, cv.camera_id, cv.s3_key))
     res.selected = [best[(cv.camera_id, cv.train_timestamp)] for cv in ordered]
-    res.batches = cluster_into_batches(ordered)
+    res.tolerance_sec = int(tolerance_sec)
+    res.batches = cluster_into_batches(ordered, tolerance_sec=int(tolerance_sec))
     return res
 
 
 def cluster_into_batches(
     videos: Sequence[CameraVideo],
+    *,
     tolerance_sec: int = TBM.DEFAULT_BATCH_TOLERANCE_SEC,
 ) -> List[TrainBatch]:
     """Group per-camera clips into one TrainBatch per train pass.
@@ -363,6 +367,13 @@ def cluster_into_batches(
                 continue
             if abs((dt - cl["anchor"]).total_seconds()) <= tolerance_sec:
                 cl["videos"][cv.camera_id] = cv
+                # Chain from the LATEST member, not the first: the four cameras
+                # are stamped from their own raw clips and can arrive in steps.
+                # Anchoring on the first member caps a train's total span at
+                # `tolerance_sec`, which split real 4-camera trains whose clips
+                # spanned ~5 min (2026-08-01).  Successive gaps are still each
+                # bounded by `tolerance_sec`.
+                cl["anchor"] = max(cl["anchor"], dt)
                 placed = True
                 break
         if not placed:
@@ -413,6 +424,10 @@ def build_manifest(
         "generated_at": datetime.now(_UTC).isoformat(),
         "requested_window": res.window.to_dict(),
         "pad_minutes": res.pad_minutes,
+        "clustering": {
+            "tolerance_sec": res.tolerance_sec,
+            "live_default_sec": TBM.DEFAULT_BATCH_TOLERANCE_SEC,
+        },
         "search": {
             "bucket": res.bucket,
             "prefixes": res.prefixes,
@@ -439,7 +454,17 @@ def log_manifest(res: DiscoveryResult, manifest: Dict[str, Any]) -> None:
     log.info("[HISTORICAL] listed %d object(s), %d classified, %d selected "
              "(clip-coverage pad %g min)",
              res.listed, res.classified, len(res.selected), res.pad_minutes)
-    log.info("[HISTORICAL] batches discovered: %d", len(res.batches))
+    n_complete = sum(1 for b in res.batches if b.is_complete())
+    log.info("[HISTORICAL] batches discovered: %d  (%d complete, %d partial; "
+             "clustering tolerance %ds)",
+             len(res.batches), n_complete, len(res.batches) - n_complete,
+             res.tolerance_sec)
+    if res.batches and n_complete * 2 < len(res.batches):
+        log.warning("[HISTORICAL] most batches are PARTIAL.  On some days the "
+                    "four cameras' clips for ONE train are stamped minutes "
+                    "apart, so a %ds tolerance splits them.  Re-run --dry-run "
+                    "with a larger --tolerance-sec (e.g. 300) and compare.",
+                    res.tolerance_sec)
 
     for entry in manifest["batches"]:
         log.info("[HISTORICAL] --- batch %d/%d  %s  (%s IST) ---",
@@ -503,6 +528,7 @@ def run(
     feat_models_dir: str,
     feature_config=None,
     pad_minutes: float = DEFAULT_PAD_MINUTES,
+    tolerance_sec: int = TBM.DEFAULT_BATCH_TOLERANCE_SEC,
     dry_run: bool = False,
     keep_inputs: bool = False,
     deliver: bool = False,
@@ -517,7 +543,8 @@ def run(
     """
     hist_root = os.path.join(workspace_root, HISTORICAL_SUBDIR)
 
-    res = select_objects(s3_client=s3_client, window=window, pad_minutes=pad_minutes)
+    res = select_objects(s3_client=s3_client, window=window,
+                         pad_minutes=pad_minutes, tolerance_sec=tolerance_sec)
     manifest = build_manifest(res, workspace_root=hist_root, dry_run=dry_run)
     log_manifest(res, manifest)
 

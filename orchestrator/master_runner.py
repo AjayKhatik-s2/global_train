@@ -851,6 +851,49 @@ def run_local(
 # CLI
 # -----------------------------------------------------------------------------
 
+def run_historical(args, *, feature_config=None) -> int:
+    """CLI adapter for `--historical`.
+
+    Resolves the requested window, opens an S3 client, and delegates to
+    `historical_runner.run`, which selects the matching trimmed clips and feeds
+    each discovered train to the SAME `process_batch` used by the live path.
+    Nothing in `run_auto` / the lifecycle scheduler is entered, and the
+    `processed_batches.json` state file is neither read nor written.
+    """
+    from orchestrator import historical_runner as HR
+
+    try:
+        window = HR.resolve_window(
+            date=args.date, start_time=args.start_time, end_time=args.end_time,
+            timezone_name=args.timezone, start_iso=args.start, end_iso=args.end,
+        )
+    except ValueError as e:
+        log.error("[HISTORICAL] %s", e)
+        return 2
+
+    try:
+        import boto3
+        s3 = boto3.client("s3", region_name=C.S3_REGION)
+    except Exception as e:  # noqa: BLE001
+        log.error("[HISTORICAL] could not create an S3 client: %s", e)
+        return 2
+
+    return HR.run(
+        s3_client=s3,
+        window=window,
+        workspace_root=args.workspace or DEFAULT_WORKSPACE_PARENT,
+        recon_models_dir=args.recon_models_dir or DEFAULT_RECON_MODELS_DIR,
+        feat_models_dir=args.feat_models_dir or DEFAULT_FEAT_MODELS_DIR,
+        feature_config=feature_config,
+        pad_minutes=(HR.DEFAULT_PAD_MINUTES if args.pad_minutes is None
+                     else args.pad_minutes),
+        dry_run=args.dry_run,
+        keep_inputs=args.keep_inputs,
+        deliver=args.historical_deliver,
+        manifest_out=args.manifest_out,
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="orchestrator.master_runner",
@@ -900,6 +943,40 @@ def _build_parser() -> argparse.ArgumentParser:
                         "--disable-features given)")
     # What the pipeline consumes (see core.pipeline_source).  Default None =
     # follow WAGONEYE_PIPELINE_SOURCE (itself defaulting to 'trimmed').
+    # ---- historical (time-range) mode --------------------------------------
+    # Purely an INPUT-SELECTION layer: it resolves which already-trimmed S3
+    # clips fall in a requested time range and hands each resulting TrainBatch
+    # to the SAME `process_batch` the live path uses.  None of these flags is
+    # read by --auto/--once/--batch/--local-only; see historical_runner.py.
+    hist = p.add_argument_group("historical mode (--historical)")
+    hist.add_argument("--historical", action="store_true",
+                      help="process already-trimmed S3 clips from a time range")
+    hist.add_argument("--date", default=None, help="YYYY-MM-DD")
+    hist.add_argument("--start-time", default=None, help="HH:MM[:SS]")
+    hist.add_argument("--end-time", default=None, help="HH:MM[:SS]")
+    hist.add_argument("--timezone", default=None,
+                      help="IANA zone for --date/--start-time/--end-time "
+                           "(default Asia/Kolkata)")
+    hist.add_argument("--start", default=None,
+                      help="ISO-8601 start, e.g. 2026-08-08T10:00:00+05:30 "
+                           "(alternative to --date/--start-time)")
+    hist.add_argument("--end", default=None, help="ISO-8601 end")
+    hist.add_argument("--pad-minutes", type=float, default=None,
+                      help="how far past its filename timestamp a clip may still "
+                           "hold its train (default 15)")
+    hist.add_argument("--dry-run", action="store_true",
+                      help="discover + print the manifest; download nothing, "
+                           "run no inference")
+    hist.add_argument("--keep-inputs", action="store_true",
+                      help="keep staged clips after a successful batch")
+    hist.add_argument("--historical-deliver", action="store_true",
+                      help="enable S3 upload + email for historical batches "
+                           "(OFF by default so a re-run cannot overwrite or "
+                           "re-notify the live delivery)")
+    hist.add_argument("--manifest-out", default=None,
+                      help="path for the JSON manifest (default: "
+                           "<workspace>/historical/historical_manifest.json)")
+
     p.add_argument("--source", dest="source", choices=["trimmed", "raw"],
                    default=None,
                    help="pipeline input source: 'trimmed' (default; already-cut "
@@ -939,17 +1016,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     # ---- Fail-fast configuration validation + redacted startup summary ----
     if args.local_only:
         mode = "local"
+    elif args.historical:
+        mode = "historical"
     elif args.batch:
         mode = "batch"
     elif args.once:
         mode = "once"
     else:
         mode = "auto"
+
+    # Historical mode needs exactly the same configuration a one-shot S3 run
+    # needs (input bucket/prefixes, output bucket), so it is validated as
+    # `once` rather than teaching validate_config a new mode -- no change to
+    # the existing validation rules.  Delivery is off unless opted into, which
+    # is what lets a historical run skip the email-endpoint requirement.
+    _hist_no_deliver = args.historical and not args.historical_deliver
+    skip_upload_eff = args.skip_upload or args.local_only or _hist_no_deliver
+    skip_email_eff = args.skip_email or args.local_only or _hist_no_deliver
+
     log.info("%s", CFG.startup_summary(mode=mode))
     cfg_errors = CFG.validate_config(
-        mode=mode,
-        skip_upload=args.skip_upload or args.local_only,
-        skip_email=args.skip_email or args.local_only,
+        mode=("once" if args.historical else mode),
+        skip_upload=skip_upload_eff,
+        skip_email=skip_email_eff,
     )
     if cfg_errors:
         for e in cfg_errors:
@@ -972,7 +1061,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # ENABLED features (a Damage-only run needs just damage.pt + recon).  Missing
     # models are downloaded from WAGONEYE_MODELS_S3_BUCKET when set; otherwise a
     # clear MISSING report is logged and startup is refused.
-    if not args.skip_model_sync:
+    # A historical --dry-run only lists S3 and prints the manifest, so it must
+    # not require (or download) model weights.
+    if not args.skip_model_sync and not (args.historical and args.dry_run):
         from core import model_sync
         report = model_sync.ensure_models_or_report(
             enabled_features=feature_config.enabled_keys(),
@@ -984,6 +1075,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                       "--skip-model-sync once the .pt files are in place.",
                       len(report.missing))
             return 2
+
+    if args.historical:
+        return run_historical(args, feature_config=feature_config)
 
     if args.local_only:
         return run_local(

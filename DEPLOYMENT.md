@@ -310,6 +310,91 @@ S3 (producer's trimmed bucket == consumer's `WAGONEYE_S3_INPUT_*`).
 
 ---
 
+## 6c. Historical mode — reprocess a past time range
+
+`--historical` runs the **same** pipeline over already-trimmed clips that are
+already in S3, selected by a date + time window. It is an *input-selection*
+layer only: reconstruction, materialization, features, fusion, overlays and
+reports are the identical code the live service runs (`process_batch`). It does
+not enter the `--auto` polling loop, the lifecycle scheduler, or
+`processed_batches.json`.
+
+```bash
+cd /opt/global_train && source .venv/bin/activate
+set -a; source deploy/wagon-eye.env; set +a
+
+# 1. ALWAYS dry-run first: lists what would be processed, downloads nothing
+python -m orchestrator.master_runner --historical \
+       --date 2026-08-08 --start-time 10:00 --end-time 12:00 \
+       --timezone Asia/Kolkata --dry-run
+
+# 2. then run it for real
+python -m orchestrator.master_runner --historical \
+       --date 2026-08-08 --start-time 10:00 --end-time 12:00 \
+       --timezone Asia/Kolkata --disable-features ocr --infer-batch 24
+```
+
+ISO timestamps work too, and the offset in the string wins:
+
+```bash
+python -m orchestrator.master_runner --historical \
+       --start "2026-08-08T10:00:00+05:30" --end "2026-08-08T12:00:00+05:30"
+```
+
+**Flags**
+
+| Flag | Meaning |
+|---|---|
+| `--date / --start-time / --end-time` | window in `--timezone` (default `Asia/Kolkata`) |
+| `--start / --end` | ISO-8601 alternative; cannot be mixed with the above |
+| `--timezone` | IANA zone name; falls back to a fixed +05:30 if tzdata is absent |
+| `--pad-minutes` | how far past its filename timestamp a clip may still hold its train (default 15) |
+| `--dry-run` | discover + print + write the manifest, then stop |
+| `--keep-inputs` | keep the staged clips after a batch succeeds |
+| `--historical-deliver` | enable S3 upload + email (**OFF by default**) |
+| `--manifest-out` | where to write the JSON manifest |
+
+All existing processing flags still apply: `--disable-features`, `--infer-batch`,
+`--stage1-frame-trim-percent`, `--raw-detections`, `--workspace`,
+`--recon-models-dir`, `--feat-models-dir`, `WAGONEYE_DEVICE`, and the rest.
+
+**How clips are matched to the window.** A trimmed clip is named after the *raw*
+clip it was cut from, and those digits are **IST wall-clock**
+(`train_extraction/time_utils.parse_timestamp_from_filename`). So the filename
+timestamp is when the raw recording started, not when the train passed — the
+train is somewhere inside `[T, T + clip span]`. Historical mode therefore keeps
+a clip when `[T, T + pad]` overlaps your window. If a train seems missing,
+widen `--pad-minutes`; the dry-run manifest prints the reason each object was
+selected.
+
+**Multiple trains.** Each train pass becomes its own batch (same
+±120 s clustering rule as the live path) with its own batch key, output
+directory and reports. Trains are never merged into one Global Train.
+
+**Missing cameras** are reported as missing and processed with the existing
+partial-camera behaviour. No substitute video is ever used.
+
+**Output location.** `<workspace>/historical/<batch_key>/`, so a historical
+re-run can never overwrite the live `batch_outputs/<batch_key>/` tree. The JSON
+manifest lands at `<workspace>/historical/historical_manifest.json`. Staged
+clips go to `<workspace>/historical/<batch_key>/downloads/` (never
+`local_inputs/`) and are removed after a batch succeeds unless `--keep-inputs`;
+a **failed** batch always keeps them for diagnosis.
+
+**Delivery is off by default** — reprocessing history should not re-email the
+operators or overwrite the delivered artifacts of the original live run. Pass
+`--historical-deliver` only when you intend to replace them.
+
+> Stop the service first if the box is busy: `sudo systemctl stop wagon-eye`.
+> Historical mode writes to a separate tree and never touches live batch state,
+> but the two will still compete for CPU and disk.
+
+**Exit codes:** `0` all batches completed · `2` bad arguments or nothing matched
+the window (the message prints the bucket, prefixes and window searched) ·
+`3` at least one batch failed.
+
+---
+
 ## 7. Monitor
 
 ```bash

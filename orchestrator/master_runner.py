@@ -890,6 +890,10 @@ def run_historical(args, *, feature_config=None) -> int:
         dry_run=args.dry_run,
         keep_inputs=args.keep_inputs,
         deliver=args.historical_deliver,
+        # --historical-deliver turns on upload + dashboard ingest; email stays
+        # separately suppressible with the existing --skip-email, so a bulk
+        # re-run can reach the dashboard without mailing the operators N times.
+        send_email=not args.skip_email,
         manifest_out=args.manifest_out,
     )
 

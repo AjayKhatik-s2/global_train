@@ -603,3 +603,93 @@ def _run_all():
 
 if __name__ == "__main__":
     _run_all()
+
+
+# -----------------------------------------------------------------------------
+# dashboard ingest (process_batch does not do it; historical must)
+# -----------------------------------------------------------------------------
+
+def test_dashboard_ingest_runs_only_when_delivering():
+    import orchestrator.master_runner as MR
+    from delivery import dashboard_ingest as DI
+
+    objs = [_obj(cam, "20260808_101500") for cam in C.ALL_CAMERAS]
+    orig_pb, orig_run = MR.process_batch, DI.run
+    calls = []
+
+    class _Out(_Outcome):
+        def __init__(self, root, batch):
+            super().__init__(C.BATCH_COMPLETED)
+            self.batch = batch
+            self.report_pdf_url = "https://x/combined.pdf"
+            self.camera_pdf_urls = {C.CAMERA_RIGHT_UP: "https://x/right_up.pdf"}
+
+    def go(deliver, send_email=True):
+        calls.clear()
+        restore = _use_prefixes()
+        root = tempfile.mkdtemp()
+
+        def fake_pb(**kw):
+            os.makedirs(os.path.join(kw["workspace_root"],
+                                     kw["batch"].batch_key), exist_ok=True)
+            fake_pb.kw = kw
+            return _Out(root, kw["batch"])
+
+        DI.run = lambda **kw: (calls.append(kw), {"enabled": True,
+                                                  "cameras": {}})[1]
+        MR.process_batch = fake_pb
+        try:
+            HR.run(s3_client=FakeS3(objs), window=_window(), workspace_root=root,
+                   recon_models_dir="/n", feat_models_dir="/n",
+                   deliver=deliver, send_email=send_email, verbose=False)
+        finally:
+            MR.process_batch, DI.run = orig_pb, orig_run
+            restore()
+        return fake_pb.kw, (calls[0] if calls else None)
+
+    pb_kw, ing = go(deliver=False)
+    assert ing is None, "no dashboard ingest without --historical-deliver"
+    assert pb_kw["skip_upload"] is True and pb_kw["skip_email"] is True
+
+    pb_kw, ing = go(deliver=True)
+    assert ing is not None and ing["skip_upload"] is False
+    assert ing["batch_root"].endswith(os.path.join(HR.HISTORICAL_SUBDIR,
+                                                   "20260808_101500"))
+    assert pb_kw["skip_upload"] is False and pb_kw["skip_email"] is False
+
+    # dashboard yes, email no
+    pb_kw, ing = go(deliver=True, send_email=False)
+    assert ing is not None
+    assert pb_kw["skip_upload"] is False and pb_kw["skip_email"] is True
+
+
+def test_dashboard_marker_seeds_pdf_urls_and_never_raises():
+    from delivery import finalization as FIN
+    from delivery import dashboard_ingest as DI
+
+    root = tempfile.mkdtemp()
+
+    class _O:
+        final_status = C.BATCH_COMPLETED
+        report_pdf_url = "https://x/combined.pdf"
+        camera_pdf_urls = {C.CAMERA_RIGHT_UP: "https://x/ru.pdf"}
+
+        class batch:
+            batch_key = "20260808_101500"
+
+    orig = DI.run
+    DI.run = lambda **kw: {"enabled": True, "cameras": {"RIGHT_UP": {}}}
+    try:
+        HR._dashboard_ingest(root, _O(), None)
+    finally:
+        DI.run = orig
+    marker = FIN.load(root)
+    assert marker and marker["upload_urls"]["pdf"] == "https://x/combined.pdf"
+    assert marker["upload_urls"]["camera_RIGHT_UP"] == "https://x/ru.pdf"
+
+    # a raising ingest is swallowed -- it must never fail the batch
+    DI.run = lambda **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        HR._dashboard_ingest(root, _O(), None)      # must not raise
+    finally:
+        DI.run = orig

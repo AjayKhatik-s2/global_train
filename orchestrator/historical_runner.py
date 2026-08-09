@@ -506,6 +506,7 @@ def run(
     dry_run: bool = False,
     keep_inputs: bool = False,
     deliver: bool = False,
+    send_email: bool = True,
     manifest_out: Optional[str] = None,
     verbose: bool = True,
 ) -> int:
@@ -533,8 +534,11 @@ def run(
         return 0
 
     if not deliver:
-        log.info("[HISTORICAL] delivery DISABLED (no S3 upload, no email) -- "
-                 "pass --historical-deliver to enable")
+        log.info("[HISTORICAL] delivery DISABLED (no S3 upload, no dashboard "
+                 "ingest, no email) -- pass --historical-deliver to enable")
+    else:
+        log.info("[HISTORICAL] delivery ENABLED: S3 upload + dashboard ingest%s",
+                 "" if send_email else " (email suppressed by --skip-email)")
 
     from orchestrator.master_runner import process_batch  # lazy: avoids a cycle
 
@@ -556,7 +560,7 @@ def run(
                 feat_models_dir=feat_models_dir,
                 s3_client=s3_client,
                 skip_upload=not deliver,
-                skip_email=not deliver,
+                skip_email=(not deliver) or (not send_email),
                 verbose=verbose,
                 feature_config=feature_config,
             )
@@ -573,6 +577,8 @@ def run(
         if outcome.report_pdf_path:
             log.info("[HISTORICAL] report: %s", outcome.report_pdf_path)
         if ok:
+            if deliver:
+                _dashboard_ingest(batch_root, outcome, s3_client)
             _cleanup_inputs(batch_root, keep_inputs=keep_inputs)
         else:
             failures.append(batch.batch_key)
@@ -583,6 +589,56 @@ def run(
     log.info("[HISTORICAL] finished: %d/%d batch(es) completed%s",
              done, total, f", failed: {failures}" if failures else "")
     return 3 if failures else 0
+
+
+def _dashboard_ingest(batch_root: str, outcome, s3_client) -> None:
+    """POST this batch's per-camera feed to the legacy dashboard.
+
+    `process_batch` -- the shared pipeline entry historical mode calls -- uploads
+    to S3 and emails, but does NOT run dashboard ingest: that step lives in
+    `lifecycle_runner.stage_finalize`, which only the live `--auto` path enters.
+    So a historical batch would upload its reports and still never appear on the
+    dashboard.  Call the SAME `dashboard_ingest.run` the live path calls.
+
+    `dashboard_ingest` reads its per-camera PDF links out of the finalization
+    marker, which only `stage_finalize` writes.  Seed a minimal one from the URLs
+    `process_batch` just produced so the dashboard entry carries working links
+    instead of blanks.  An existing marker is never overwritten.
+
+    Never raises: a dashboard failure must not change the batch's outcome, which
+    is the same guarantee `stage_finalize` gives.
+    """
+    try:
+        from delivery import dashboard_ingest, finalization as FIN
+
+        if not dashboard_ingest.is_enabled():
+            log.info("[HISTORICAL] dashboard ingest is disabled "
+                     "(WAGONEYE_DASHBOARD_INGEST_ENABLED=false) -- skipped")
+            return
+
+        urls = {f"camera_{cam}": u
+                for cam, u in (getattr(outcome, "camera_pdf_urls", None) or {}).items()
+                if u}
+        if getattr(outcome, "report_pdf_url", None):
+            urls["pdf"] = outcome.report_pdf_url
+        if urls and FIN.load(batch_root) is None:
+            FIN.write(batch_root, {
+                "batch_key": outcome.batch.batch_key,
+                "terminal_status": outcome.final_status,
+                "upload_urls": urls,
+                "uploaded": True,
+                "source": "historical",
+            })
+
+        res = dashboard_ingest.run(batch_root=batch_root, s3_client=s3_client,
+                                   skip_upload=False)
+        cams = res.get("cameras") or {}
+        log.info("[HISTORICAL] dashboard ingest: enabled=%s cameras=%s%s",
+                 res.get("enabled"), list(cams),
+                 f" error={res['error']}" if res.get("error") else "")
+    except Exception as e:  # noqa: BLE001
+        log.error("[HISTORICAL] dashboard ingest error (non-fatal): %s", e,
+                  exc_info=True)
 
 
 def _cleanup_inputs(batch_root: str, *, keep_inputs: bool) -> None:

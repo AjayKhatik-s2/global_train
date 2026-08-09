@@ -40,6 +40,7 @@ def _build_json(
     batch_key: str, payloads: Dict[str, Dict[str, Any]],
     report_meta: Optional[Dict[str, Any]], missing_cameras: Sequence[str],
     source_video_urls: Dict[str, str], processed_video_urls: Dict[str, str],
+    wagon_overview: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Canonical machine-readable JSON companion to the PDF.
 
@@ -64,6 +65,12 @@ def _build_json(
         "processed_video_urls": dict(processed_video_urls or {}),
         "cameras": {cam: payloads.get(cam, {}) for cam in C.ALL_CAMERAS},
         "wagons": [u.to_dict() for u in wagons],
+        # Additive: the four per-camera wagon-CENTRE overview panels rendered on
+        # each wagon page, keyed by Global Wagon ID (each entry carries `order`,
+        # the canonical Global Train position).  Existing consumers that read
+        # `cameras` / `wagons` are unaffected.
+        "wagon_overview": dict(wagon_overview or {}),
+        "wagon_overview_camera_order": list(LDA.OVERVIEW_CAMERA_ORDER),
     }
 
 
@@ -79,14 +86,23 @@ def build(
     evidence_root: Optional[str] = None,
     wagon_states_root: Optional[str] = None,
     cache_root: Optional[str] = None,
+    per_camera_tracking_path: Optional[str] = None,
     missing_cameras: Optional[Sequence[str]] = None,
     camera_pdf_urls: Optional[Dict[str, str]] = None,
     logo_path: Optional[str] = None,
     report_meta: Optional[Dict[str, Any]] = None,
     verbose: bool = True,
 ) -> Dict[str, Optional[str]]:
-    """Build the combined PDF (old layout) + canonical JSON.  Never loads a model."""
-    del extra_metadata, cache_root  # accepted for signature parity; not needed here
+    """Build the combined PDF (old layout) + canonical JSON.  Never loads a model.
+
+    `cache_root` + `per_camera_tracking_path` feed ONLY the additive wagon-by-
+    wagon 4-camera overview section: `cache_root` is Stage 2's `wagon_cache/`
+    (the materialized per-wagon, per-camera frames) and the tracking JSON
+    supplies each camera's own fps/total_frames/gaps.  Both are optional -- with
+    neither, the overview degrades to placeholders (or is skipped entirely) and
+    every pre-existing section renders exactly as before.
+    """
+    del extra_metadata  # accepted for signature parity; not needed here
     os.makedirs(output_dir, exist_ok=True)
     source_video_urls = dict(source_video_urls or {})
     processed_video_urls = dict(processed_video_urls or {})
@@ -104,6 +120,23 @@ def build(
     )
     sp = LDA.split_for_combined(payloads)
 
+    # 1b) Additive: one wagon-CENTRE overview frame per (Global Wagon, camera).
+    #     Uses the SAME Global-Wagon -> camera-local frame mapping as Stage 2
+    #     (`_evidence_lookup.wagon_local_frames` over `wagon_cache/`); never
+    #     raises -- a failure here must not cost us the whole combined report.
+    wagon_overview: Dict[str, Any] = {}
+    try:
+        wagon_overview = LDA.build_wagon_overview(
+            state=state, unified=unified,
+            cache_root=cache_root, evidence_root=evidence_root,
+            per_camera_tracking_path=per_camera_tracking_path,
+            verbose=verbose,
+        )
+    except Exception as e:
+        print(f"[STAGE5] wagon overview evidence FAILED "
+              f"(report continues): {type(e).__name__}: {e}")
+        traceback.print_exc(limit=3)
+
     # 2) Canonical JSON (always written, even if PDF fails).
     json_path = os.path.join(output_dir, JSON_NAME)
     json_doc = _build_json(
@@ -111,6 +144,7 @@ def build(
         report_meta=report_meta, missing_cameras=missing_cameras,
         source_video_urls=source_video_urls,
         processed_video_urls=processed_video_urls,
+        wagon_overview=wagon_overview,
     )
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(json_doc, f, indent=2, default=str)
@@ -139,6 +173,10 @@ def build(
         gen.generate(
             sp["left_data"], sp["right_data"], sp["top_data"], sp["left_top_data"],
             missing_cameras=missing_cameras,
+            # Additive kwargs only; with an empty `wagon_overview` the generator
+            # emits the pre-existing report unchanged.
+            wagon_overview=wagon_overview,
+            camera_order=LDA.OVERVIEW_CAMERA_ORDER,
         )
         if not os.path.isfile(pdf_path):
             pdf_path = None

@@ -152,6 +152,233 @@ def midpoint_cache_path(
 
 
 # -----------------------------------------------------------------------------
+# Wagon-CENTRE overview frame  (combined report's 4-camera wagon pages)
+# -----------------------------------------------------------------------------
+#
+# This is the GENERAL WAGON OVERVIEW selector -- deliberately distinct from the
+# feature-specific "best snapshot" selectors (`evidence_snapshot`,
+# `damage_track_snapshots`, `core.frame_quality.snapshot_score`).  Those pick the
+# frame that best shows a DETECTED DEFECT; this one picks the frame that best
+# shows the MIDDLE OF THE WAGON, with no reference to any model output.  Both
+# stay available side by side; neither replaces the other.
+#
+# Source of truth for the mapping is Stage 2's own materialization: every frame
+# the materializer wrote lives at
+#     wagon_cache/<gw_id>/<camera_folder>/frame_<ORIGINAL_LOCAL_FRAME>.jpg
+# so the filename IS the original source-video frame number for that camera and
+# the directory listing IS that camera's mapped interval for that Global Wagon.
+# `wagon_local_frames()` above (identical arithmetic to
+# materializer/wagon_cache_builder._wagon_local_range and
+# wagon_count/video_segmenter) supplies the authoritative interval whenever
+# per-camera fps/total_frames are known, and is used to place the centre target.
+
+# A truncated/0-byte JPEG is smaller than this; used as a cheap first gate
+# before the (more expensive) header decode.
+_MIN_FRAME_BYTES = 512
+
+# Hard cap on decode probes per (wagon, camera) so a wholly corrupt cache
+# directory can never make report generation quadratic.
+_MAX_DECODE_PROBES = 32
+
+# Selection outcome sentinels (carried into the report + the combined JSON).
+OVERVIEW_OK               = "OK"
+OVERVIEW_NO_CACHE_ROOT    = "NO_CACHE_ROOT"
+OVERVIEW_NO_FRAMES        = "NO_FRAMES"
+OVERVIEW_NO_READABLE      = "NO_READABLE_FRAME"
+
+
+def list_cache_frame_indices(
+    cache_root: Optional[str], gw_id: str, camera_id: str,
+) -> List[int]:
+    """Sorted ORIGINAL local frame numbers materialized for one (wagon, camera).
+
+    Parsed straight out of the `frame_NNNNNN.jpg` names Stage 2 wrote, so the
+    numbering stays tied to the source video and every returned index is
+    traceable back to it.  Empty list when the camera contributed nothing to
+    this wagon (missing feed, empty/invalid mapped interval, or a cache that
+    was pruned).
+    """
+    if not cache_root:
+        return []
+    folder = C.CAMERA_FOLDER.get(camera_id, camera_id.lower())
+    d = os.path.join(cache_root, gw_id, folder)
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    out: List[int] = []
+    for name in names:
+        if not (name.startswith("frame_") and name.endswith(".jpg")):
+            continue
+        try:
+            out.append(int(name[len("frame_"):-len(".jpg")]))
+        except ValueError:
+            continue
+    out.sort()
+    return out
+
+
+def _frame_readable(path: str) -> bool:
+    """True when the JPEG can actually be embedded in the PDF.
+
+    Uses reportlab's own `ImageReader` (header-only size probe) so the check
+    agrees with what the report will do at build time.  Falls back to a size
+    check if reportlab/PIL cannot be imported, so this module stays usable in a
+    pure path-resolution context.
+    """
+    try:
+        if os.path.getsize(path) < _MIN_FRAME_BYTES:
+            return False
+    except OSError:
+        return False
+    try:
+        from reportlab.lib.utils import ImageReader
+    except Exception:
+        return True
+    try:
+        w, h = ImageReader(path).getSize()
+    except Exception:
+        return False
+    return bool(w and h)
+
+
+def _in_any_gap(frame_idx: int, gaps: Sequence[Dict[str, Any]]) -> bool:
+    """True when a local frame falls inside a Stage-1 detected gap for this
+    camera.  Read-only use of the existing per_camera_tracking.json gap list --
+    no gap detection is performed or altered here."""
+    for g in gaps or ():
+        if not isinstance(g, dict):
+            continue
+        try:
+            gs = int(g["start_frame"])
+            ge = int(g["end_frame"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if gs <= frame_idx <= ge:
+            return True
+    return False
+
+
+def center_cache_frame(
+    *,
+    cache_root: Optional[str],
+    gw_id: str,
+    camera_id: str,
+    wagon_start_time: float,
+    wagon_end_time: float,
+    local_fps: float = 0.0,
+    local_total_frames: int = 0,
+    gaps: Optional[Sequence[Dict[str, Any]]] = None,
+    avoid_boundary: bool = True,
+    max_probes: int = _MAX_DECODE_PROBES,
+) -> Dict[str, Any]:
+    """Pick ONE wagon-centre overview frame for a (Global Wagon, camera) pair.
+
+    Deterministic, model-free, and scoped strictly to this wagon's own mapped
+    interval in THIS camera's local frame space -- a frame belonging to GW_n+1
+    can never be returned for GW_n because it is not in GW_n's cache directory
+    and, when fps is known, not inside GW_n's `wagon_local_frames()` interval.
+
+    Selection order:
+      1. Candidate pool = frames Stage 2 materialized for (gw, camera).
+      2. Intersect with the mapped interval from `wagon_local_frames()` when
+         fps/total_frames are known (skipped only if that would empty the pool,
+         which would mean cache and mapping disagree -- reported via `clipped`).
+      3. Drop frames inside a Stage-1 gap for this camera (skipped if it would
+         empty the pool).
+      4. Target = temporal centre of the mapped interval, `(start + end) // 2`
+         -- the same midpoint convention as `midpoint_cache_path`.
+      5. Prefer the interior (drop the first/last frame of the pool) when the
+         pool is long enough, so a boundary frame is never chosen while an
+         interior one exists.
+      6. Walk candidates by (|frame - target|, frame) and return the first that
+         decodes.  Ties break to the LOWER frame number, so repeated runs on the
+         same inputs always select the same frame.
+
+    Returns a dict -- never raises, never returns another wagon's frame:
+        {status, path, frame, start_frame, end_frame, target_frame,
+         candidates, clipped, gap_filtered}
+    `status != OK` means the caller must render a NO FRAME AVAILABLE placeholder
+    for this camera and carry on with the other three.
+    """
+    res: Dict[str, Any] = {
+        "status": OVERVIEW_NO_CACHE_ROOT,
+        "path": None,
+        "frame": None,
+        "start_frame": None,
+        "end_frame": None,
+        "target_frame": None,
+        "candidates": 0,
+        "clipped": False,
+        "gap_filtered": False,
+    }
+    if not cache_root:
+        return res
+
+    # --- mapped interval (authoritative when per-camera meta is available) ---
+    sf: Optional[int] = None
+    ef: Optional[int] = None
+    if local_fps > 0 and local_total_frames > 0:
+        _sf, _ef = wagon_local_frames(
+            wagon_start_time, wagon_end_time, local_fps, local_total_frames,
+        )
+        if _ef >= _sf:
+            sf, ef = _sf, _ef
+    res["start_frame"], res["end_frame"] = sf, ef
+
+    indices = list_cache_frame_indices(cache_root, gw_id, camera_id)
+    if not indices:
+        res["status"] = OVERVIEW_NO_FRAMES
+        return res
+
+    pool = indices
+    if sf is not None:
+        inside = [i for i in pool if sf <= i <= ef]
+        if inside:
+            pool = inside
+            res["clipped"] = len(inside) != len(indices)
+        # else: cache and mapping disagree -- keep the materialized frames (they
+        # are this wagon's own, by construction) and fall back to their span.
+    if sf is None or not (sf <= pool[0] and pool[-1] <= ef):
+        sf, ef = pool[0], pool[-1]
+        res["start_frame"], res["end_frame"] = sf, ef
+
+    if gaps:
+        ungapped = [i for i in pool if not _in_any_gap(i, gaps)]
+        if ungapped and len(ungapped) != len(pool):
+            pool = ungapped
+            res["gap_filtered"] = True
+
+    target = (sf + ef) // 2
+    res["target_frame"] = target
+    res["candidates"] = len(pool)
+
+    # Interior-first: never hand back an entry/exit boundary frame while an
+    # interior frame is usable.  (Feature inference's stable-interior trim is a
+    # separate, inference-only concept and is intentionally not reused here --
+    # reports use the full wagon span.)
+    interior = pool[1:-1] if (avoid_boundary and len(pool) >= 5) else []
+
+    seen = set()
+    for cand in (interior, pool):
+        if not cand:
+            continue
+        for idx in sorted(cand, key=lambda i: (abs(i - target), i))[:max_probes]:
+            if idx in seen:
+                continue
+            seen.add(idx)
+            p = _cache_frame_path(cache_root, gw_id, camera_id, idx)
+            if os.path.isfile(p) and _frame_readable(p):
+                res["status"] = OVERVIEW_OK
+                res["path"] = p
+                res["frame"] = idx
+                return res
+
+    res["status"] = OVERVIEW_NO_READABLE
+    return res
+
+
+# -----------------------------------------------------------------------------
 # Evidence snapshot path resolution
 # -----------------------------------------------------------------------------
 

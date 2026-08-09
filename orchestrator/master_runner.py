@@ -443,6 +443,7 @@ def process_batch(
             evidence_root=evidence_root,
             wagon_states_root=states_root,
             cache_root=cache_root,
+            per_camera_tracking_path=_per_camera_tracking_path,
             missing_cameras=list(batch.missing_cameras()),
             camera_pdf_urls=camera_pdf_urls,
             logo_path=_logo_path,

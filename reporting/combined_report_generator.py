@@ -55,6 +55,14 @@ SECTION_TEAL_BG = colors.HexColor('#E0F2F1') # Light teal section background
 WARN_BG = colors.HexColor('#FFF3E0')         # Warning background (amber)
 WARN_BORDER = colors.HexColor('#E65100')     # Warning border
 
+# Default panel order for the wagon-by-wagon 2x2 overview grid.  Matches the
+# camera ordering this report already uses in its VIDEO EVIDENCE / DETAILED
+# REPORTS / WAGON INSPECTION DETAILS sections, so the whole PDF reads the same
+# way:  top-left | top-right | bottom-left | bottom-right.
+# `generate(..., camera_order=...)` overrides it; whatever order is in force is
+# applied identically to every wagon page.
+OVERVIEW_CAMERA_ORDER = ('LEFT_UP', 'RIGHT_UP', 'RIGHT_UP_TOP', 'LEFT_UP_TOP')
+
 
 class CombinedReportGenerator:
     """
@@ -1365,6 +1373,428 @@ class CombinedReportGenerator:
         return elements
 
     # ══════════════════════════════════════════════════════════════════════
+    # WAGON-BY-WAGON 4-CAMERA VISUAL INSPECTION  (additive section)
+    # ══════════════════════════════════════════════════════════════════════
+    #
+    # Everything below is APPENDED after the existing report.  When the caller
+    # supplies no `wagon_overview` payload these methods return [] and the PDF
+    # is byte-for-byte the previous report -- the existing header, summary,
+    # wagon table and Damaged Wagon Report sections are never touched.
+    #
+    # Two evidence layers live side by side on each wagon page:
+    #   (1) four GENERAL wagon-centre overview panels, one per camera, selected
+    #       purely from the centre of that camera's mapped frame interval;
+    #   (2) the EXISTING feature-specific evidence snapshots (door / damage /
+    #       OCR / load), reproduced unchanged.
+    # (1) never replaces (2) and (2) never replaces (1).
+
+    @staticmethod
+    def _ov_esc(value) -> str:
+        """Escape a data-derived string for a reportlab Paragraph."""
+        return (str('' if value is None else value)
+                .replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+
+    def _ov_findings_text(self, findings, missing_cameras):
+        """One-line finding digest for the index table.  Reads the ALREADY-FUSED
+        values verbatim -- no re-classification, no thresholding."""
+        missing = set(missing_cameras or [])
+        bits = []
+        for cam, key, label in (('LEFT_UP', 'left_door', 'L-DOOR'),
+                                ('RIGHT_UP', 'right_door', 'R-DOOR')):
+            if cam in missing:
+                continue
+            v = str(findings.get(key) or '')
+            if v and v != 'NO_DATA':
+                bits.append(f"{label}:{v}")
+        load = str(findings.get('load_status') or '')
+        if load and load != 'NO_DATA':
+            bits.append(f"LOAD:{load}")
+        for key, label in (('top_damage', 'TOP-DMG'), ('side_damage', 'SIDE-DMG')):
+            v = str(findings.get(key) or '')
+            if v and v != 'NO_DATA':
+                bits.append(f"{label}:{v}")
+        return ', '.join(bits) if bits else '-'
+
+    def _ov_image_cell(self, label, panel, label_style, placeholder_style,
+                       note_style, max_w, max_h, unavailable_reason=None):
+        """One 2x2 panel: camera label on top, image (or placeholder) below.
+
+        A camera with no usable frame renders `NO FRAME AVAILABLE` -- never a
+        fabricated image and never a frame borrowed from another wagon.  Any
+        per-image failure degrades to the same placeholder instead of aborting
+        the page or the report.
+        """
+        cell = [Paragraph(f"<b>{self._ov_esc(label)}</b>", label_style),
+                Spacer(1, 0.03 * inch)]
+
+        path = (panel or {}).get('path')
+        note = unavailable_reason
+        if path and os.path.exists(path):
+            try:
+                img = Image(path)
+                img_w, img_h = img.drawWidth, img.drawHeight
+                # Uniform display box, aspect ratio preserved (never stretched,
+                # never cropped -- the source frame is shown as materialized).
+                scale = min(max_w / img_w, max_h / img_h, 1.0)
+                if scale < 1.0:
+                    img_w *= scale
+                    img_h *= scale
+                img.drawWidth = img_w
+                img.drawHeight = img_h
+                cell.append(img)
+                # Original source-video frame number, so any panel in the PDF
+                # can be traced straight back to that camera's raw video.
+                frame_no = (panel or {}).get('frame')
+                if frame_no is not None:
+                    cell.append(Paragraph(f"source frame {int(frame_no)}", note_style))
+                return cell
+            except Exception as e:
+                note = f"UNREADABLE ({type(e).__name__})"
+                print(f"  ⚠ Wagon overview image failed to load {path}: {e}")
+
+        if not note:
+            note = (panel or {}).get('status') or 'NO_FRAMES'
+        cell.append(Spacer(1, max_h * 0.38))
+        cell.append(Paragraph("<b>NO FRAME AVAILABLE</b>", placeholder_style))
+        cell.append(Paragraph(self._ov_esc(note), placeholder_style))
+        return cell
+
+    def _create_wagon_overview_index(self, wagons, missing_cameras, camera_order):
+        """Index page: every Global Wagon, in canonical Global Train order."""
+        elements = []
+
+        col_header_style = ParagraphStyle(
+            'OvIdxHeader', parent=self.styles['Normal'], fontSize=8,
+            alignment=TA_CENTER, textColor=WHITE,
+            fontName='Helvetica-Bold', leading=11)
+        cell_style = ParagraphStyle(
+            'OvIdxCell', parent=self.styles['Normal'], fontSize=8,
+            alignment=TA_CENTER, textColor=colors.HexColor('#263238'),
+            fontName='Helvetica', leading=10)
+        cell_bold = ParagraphStyle(
+            'OvIdxCellBold', parent=cell_style, fontName='Helvetica-Bold',
+            textColor=colors.HexColor('#1A1A2E'))
+
+        title_row = [Paragraph('<b>WAGON-BY-WAGON VISUAL INSPECTION &#8212; INDEX</b>',
+                               self.styles['SectionTitleWhite']), '', '', '', '', '', '']
+        header_row = [
+            Paragraph("SR.NO", col_header_style),
+            Paragraph("GLOBAL<br/>WAGON", col_header_style),
+            Paragraph("CLASSIFICATION", col_header_style),
+            Paragraph("WAGON NUMBER", col_header_style),
+            Paragraph("FINDINGS", col_header_style),
+            Paragraph("CAMERA<br/>VIEWS", col_header_style),
+            Paragraph("SHEET", col_header_style),
+        ]
+        table_data = [title_row, header_row]
+
+        n_cams = max(1, len(camera_order))
+        for sheet_no, w in enumerate(wagons, start=1):
+            panels = w.get('cameras') or {}
+            n_ok = sum(1 for c in camera_order
+                       if (panels.get(c) or {}).get('status') == 'OK')
+            ocr = w.get('findings', {}).get('wagon_identifier') or '-'
+            if str(ocr) in ('NO_DATA', '', 'None'):
+                ocr = '-'
+            table_data.append([
+                Paragraph(str(w.get('wagon_number', sheet_no)), cell_style),
+                Paragraph(f"<b>{self._ov_esc(w.get('global_id'))}</b>", cell_bold),
+                Paragraph(self._ov_esc(w.get('classification_display')
+                                       or w.get('classification')), cell_style),
+                Paragraph(self._ov_esc(ocr), cell_style),
+                Paragraph(self._ov_esc(
+                    self._ov_findings_text(w.get('findings') or {}, missing_cameras)),
+                    cell_style),
+                Paragraph(f"{n_ok}/{n_cams}",
+                          cell_style if n_ok == n_cams else cell_bold),
+                Paragraph(str(sheet_no), cell_style),
+            ])
+
+        table = Table(
+            table_data,
+            colWidths=[0.6 * inch, 1.1 * inch, 1.3 * inch, 1.7 * inch,
+                       2.9 * inch, 1.2 * inch, 1.2 * inch],
+            repeatRows=2)
+        style = [
+            ('SPAN', (0, 0), (-1, 0)),
+            ('BACKGROUND', (0, 0), (-1, 0), NAVY_MID),
+            ('BACKGROUND', (0, 1), (-1, 1), NAVY_DARK),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('BOX', (0, 0), (-1, -1), 1, SLATE_BORDER),
+            ('INNERGRID', (0, 1), (-1, -1), 0.5, SLATE_BORDER),
+            ('LEFTPADDING', (0, 0), (-1, -1), 4),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+            ('TOPPADDING', (0, 0), (-1, -1), 5),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ]
+        for i in range(len(wagons)):
+            style.append(('BACKGROUND', (0, i + 2), (-1, i + 2),
+                          WHITE if i % 2 == 0 else SLATE_BG))
+        table.setStyle(TableStyle(style))
+        elements.append(table)
+        elements.append(Spacer(1, 0.08 * inch))
+        elements.append(Paragraph(
+            "SHEET = position of the wagon's page within this section; wagon "
+            "pages follow below in Global Train order (GW_1 first).",
+            self.styles['SmallNote']))
+        return elements
+
+    def _create_wagon_overview_pages(self, wagon_overview, missing_cameras=None,
+                                     camera_order=None):
+        """Append one page per Global Wagon: 2x2 four-camera overview + findings.
+
+        `wagon_overview` is `{gw_id -> payload}` as produced by
+        `_legacy_data_adapter.build_wagon_overview`.  Wagons are emitted strictly
+        by their canonical Global Train `order` -- never by camera, confidence,
+        damage or filename -- and the Global Wagon ID is the only join key, so
+        all four panels on a page are the same physical wagon.
+        """
+        if not wagon_overview:
+            return []
+
+        missing_cameras = list(missing_cameras or [])
+        camera_order = list(camera_order or OVERVIEW_CAMERA_ORDER)
+
+        # Canonical Global Train order, explicit and independent of dict order.
+        wagons = sorted(
+            (w for w in wagon_overview.values() if isinstance(w, dict)),
+            key=lambda w: (int(w.get('order') or 0), str(w.get('global_id') or '')))
+        if not wagons:
+            return []
+
+        elements = [PageBreak()]
+
+        banner = Table([[Paragraph("WAGON-BY-WAGON VISUAL INSPECTION",
+                                   self.styles['BannerTitle'])],
+                        [Paragraph(f"{len(wagons)} Global Wagons &#183; four camera "
+                                   f"views per wagon &#183; wagon-centre overview",
+                                   self.styles['BannerDate'])]],
+                       colWidths=[10.0 * inch])
+        banner.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), NAVY_DARK),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('TOPPADDING', (0, 0), (0, 0), 12),
+            ('BOTTOMPADDING', (0, 0), (0, 0), 2),
+            ('TOPPADDING', (0, 1), (0, 1), 0),
+            ('BOTTOMPADDING', (0, 1), (0, 1), 10),
+            ('BOX', (0, 0), (-1, -1), 1.5, NAVY_DARK),
+        ]))
+        elements.append(banner)
+        elements.append(Spacer(1, 0.15 * inch))
+        elements.extend(self._create_wagon_overview_index(
+            wagons, missing_cameras, camera_order))
+
+        # ── per-wagon styles (built once) ──
+        gw_title_style = ParagraphStyle(
+            'OvGwTitle', parent=self.styles['Normal'], fontSize=14,
+            alignment=TA_CENTER, textColor=WHITE,
+            fontName='Helvetica-Bold', leading=18)
+        gw_sub_style = ParagraphStyle(
+            'OvGwSub', parent=self.styles['Normal'], fontSize=9,
+            alignment=TA_CENTER, textColor=colors.HexColor('#B0BEC5'),
+            fontName='Helvetica', leading=12)
+        meta_header_style = ParagraphStyle(
+            'OvMetaHeader', parent=self.styles['Normal'], fontSize=7.5,
+            alignment=TA_CENTER, textColor=WHITE,
+            fontName='Helvetica-Bold', leading=10)
+        meta_cell_style = ParagraphStyle(
+            'OvMetaCell', parent=self.styles['Normal'], fontSize=8,
+            alignment=TA_CENTER, textColor=colors.HexColor('#263238'),
+            fontName='Helvetica-Bold', leading=11)
+        panel_label_style = ParagraphStyle(
+            'OvPanelLabel', parent=self.styles['Normal'], fontSize=9,
+            alignment=TA_CENTER, textColor=colors.HexColor('#0B1D3A'),
+            fontName='Helvetica-Bold', leading=12)
+        panel_note_style = ParagraphStyle(
+            'OvPanelNote', parent=self.styles['Normal'], fontSize=7,
+            alignment=TA_CENTER, textColor=colors.HexColor('#78909C'),
+            fontName='Helvetica', leading=9)
+        placeholder_style = ParagraphStyle(
+            'OvPlaceholder', parent=self.styles['Normal'], fontSize=9,
+            alignment=TA_CENTER, textColor=NO_FEED_RED,
+            fontName='Helvetica-Bold', leading=12)
+        ev_label_style = ParagraphStyle(
+            'OvEvLabel', parent=self.styles['Normal'], fontSize=7,
+            alignment=TA_CENTER, textColor=colors.HexColor('#37474F'),
+            fontName='Helvetica-Bold', leading=9)
+
+        GRID_COL_W = 4.8 * inch
+        GRID_ROW_H = 2.10 * inch
+        IMG_MAX_W = 4.45 * inch
+        IMG_MAX_H = 1.62 * inch
+        EV_MAX_W = 2.15 * inch
+        EV_MAX_H = 1.00 * inch
+        MAX_EVIDENCE_THUMBS = 4
+
+        missing_set = set(missing_cameras)
+
+        for w in wagons:
+            try:
+                elements.append(PageBreak())
+                panels = w.get('cameras') or {}
+                findings = w.get('findings') or {}
+                gw_id = w.get('global_id') or '?'
+
+                # ── GW banner ──
+                cls_disp = (w.get('classification_display')
+                            or w.get('classification') or 'UNKNOWN')
+                conf = float(w.get('classification_confidence') or 0.0)
+                sub_bits = [f"CLASSIFICATION: {self._ov_esc(cls_disp)}"]
+                if conf > 0:
+                    sub_bits.append(f"CONFIDENCE: {conf * 100:.0f}%")
+                sub_bits.append(
+                    f"MASTER FRAMES: {int(w.get('start_frame_master') or 0)}"
+                    f"&#8211;{int(w.get('end_frame_master') or 0)}")
+                sub_bits.append(
+                    f"{float(w.get('start_time') or 0.0):.2f}s"
+                    f"&#8211;{float(w.get('end_time') or 0.0):.2f}s")
+
+                gw_banner = Table(
+                    [[Paragraph(f"GLOBAL WAGON: {self._ov_esc(gw_id)}", gw_title_style)],
+                     [Paragraph("  &#183;  ".join(sub_bits), gw_sub_style)]],
+                    colWidths=[10.0 * inch])
+                gw_banner.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, -1), NAVY_MID),
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('TOPPADDING', (0, 0), (0, 0), 8),
+                    ('BOTTOMPADDING', (0, 0), (0, 0), 1),
+                    ('TOPPADDING', (0, 1), (0, 1), 0),
+                    ('BOTTOMPADDING', (0, 1), (0, 1), 7),
+                    ('BOX', (0, 0), (-1, -1), 1, NAVY_DARK),
+                ]))
+                elements.append(gw_banner)
+                elements.append(Spacer(1, 0.08 * inch))
+
+                # ── findings row (existing fused values, unchanged) ──
+                ocr = findings.get('wagon_identifier') or '-'
+                if str(ocr) in ('NO_DATA', '', 'None'):
+                    ocr = '-'
+
+                def _fld(key, owning_cameras):
+                    # NO FEED only when EVERY camera that can own this field is
+                    # missing -- fusion may legitimately have sourced it from a
+                    # sibling camera (e.g. load falling back to LEFT_UP_TOP).
+                    if owning_cameras and missing_set.issuperset(owning_cameras):
+                        return '⚠ NO FEED'
+                    v = str(findings.get(key) or '')
+                    return v if v else 'NO_DATA'
+
+                meta_headers = ["WAGON NUMBER", "SR.NO", "LEFT DOOR", "RIGHT DOOR",
+                                "LOAD", "TOP DAMAGE", "SIDE DAMAGE", "OVERALL CONF."]
+                meta_values = [
+                    str(ocr),
+                    str(w.get('wagon_number') or ''),
+                    _fld('left_door', ('LEFT_UP',)),
+                    _fld('right_door', ('RIGHT_UP',)),
+                    _fld('load_status', ('RIGHT_UP_TOP', 'LEFT_UP_TOP')),
+                    _fld('top_damage', ('RIGHT_UP_TOP', 'LEFT_UP_TOP')),
+                    _fld('side_damage', ('RIGHT_UP', 'LEFT_UP')),
+                    f"{float(findings.get('confidence') or 0.0) * 100:.0f}%",
+                ]
+                meta_table = Table(
+                    [[Paragraph(h, meta_header_style) for h in meta_headers],
+                     [Paragraph(self._ov_esc(v), meta_cell_style) for v in meta_values]],
+                    colWidths=[1.7 * inch, 0.7 * inch, 1.25 * inch, 1.25 * inch,
+                               1.1 * inch, 1.35 * inch, 1.35 * inch, 1.3 * inch])
+                meta_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), NAVY_DARK),
+                    ('BACKGROUND', (0, 1), (-1, 1), SLATE_BG),
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('BOX', (0, 0), (-1, -1), 0.75, SLATE_BORDER),
+                    ('INNERGRID', (0, 0), (-1, -1), 0.5, SLATE_BORDER),
+                    ('TOPPADDING', (0, 0), (-1, -1), 4),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                ]))
+                elements.append(meta_table)
+                elements.append(Spacer(1, 0.08 * inch))
+
+                # ── 2x2 four-camera wagon-centre overview grid ──
+                cells = []
+                for cam in camera_order:
+                    panel = panels.get(cam) or {}
+                    reason = 'CAMERA FEED MISSING' if cam in missing_set else None
+                    cells.append(self._ov_image_cell(
+                        cam, panel, panel_label_style, placeholder_style,
+                        panel_note_style, IMG_MAX_W, IMG_MAX_H,
+                        unavailable_reason=reason))
+                while len(cells) % 2:
+                    cells.append([Paragraph('', panel_label_style)])
+
+                grid_rows = [cells[i:i + 2] for i in range(0, len(cells), 2)]
+                grid = Table(grid_rows,
+                             colWidths=[GRID_COL_W] * 2,
+                             rowHeights=[GRID_ROW_H] * len(grid_rows))
+                grid.setStyle(TableStyle([
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 4),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+                    ('TOPPADDING', (0, 0), (-1, -1), 4),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                    ('BOX', (0, 0), (-1, -1), 0.75, SLATE_BORDER),
+                    ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#E0E0E0')),
+                    ('BACKGROUND', (0, 0), (-1, -1), WHITE),
+                ]))
+                elements.append(grid)
+
+                # ── existing feature-specific evidence (layer 2) ──
+                ev_items = [e for e in (w.get('feature_evidence') or [])
+                            if e.get('path') and os.path.exists(e['path'])
+                            ][:MAX_EVIDENCE_THUMBS]
+                if ev_items:
+                    elements.append(Spacer(1, 0.06 * inch))
+                    ev_cells = []
+                    for e in ev_items:
+                        try:
+                            img = Image(e['path'])
+                            s = min(EV_MAX_W / img.drawWidth,
+                                    EV_MAX_H / img.drawHeight, 1.0)
+                            img.drawWidth *= s
+                            img.drawHeight *= s
+                            ev_cells.append([
+                                Paragraph(f"<b>{self._ov_esc(e.get('label'))}</b>",
+                                          ev_label_style),
+                                Spacer(1, 0.02 * inch), img])
+                        except Exception as exc:
+                            print(f"  ⚠ Feature evidence image failed "
+                                  f"{e.get('path')}: {exc}")
+                    if ev_cells:
+                        while len(ev_cells) < MAX_EVIDENCE_THUMBS:
+                            ev_cells.append([Paragraph('', ev_label_style)])
+                        ev_table = Table(
+                            [[Paragraph('<b>FEATURE EVIDENCE (existing '
+                                        'detection snapshots)</b>',
+                                        self.styles['SectionTitleWhite'])] +
+                             [''] * (MAX_EVIDENCE_THUMBS - 1),
+                             ev_cells],
+                            colWidths=[2.4 * inch] * MAX_EVIDENCE_THUMBS)
+                        ev_table.setStyle(TableStyle([
+                            ('SPAN', (0, 0), (-1, 0)),
+                            ('BACKGROUND', (0, 0), (-1, 0), TEAL_ACCENT),
+                            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                            ('VALIGN', (0, 1), (-1, 1), 'TOP'),
+                            ('TOPPADDING', (0, 0), (-1, 0), 3),
+                            ('BOTTOMPADDING', (0, 0), (-1, 0), 3),
+                            ('TOPPADDING', (0, 1), (-1, 1), 4),
+                            ('BOTTOMPADDING', (0, 1), (-1, 1), 4),
+                            ('BOX', (0, 0), (-1, -1), 0.75, SLATE_BORDER),
+                            ('INNERGRID', (0, 1), (-1, 1), 0.5,
+                             colors.HexColor('#E0E0E0')),
+                        ]))
+                        elements.append(ev_table)
+
+            except Exception as e:
+                # One bad wagon must never take down the report.
+                print(f"  ⚠ Wagon overview page failed for "
+                      f"{w.get('global_id', '?')}: {type(e).__name__}: {e}")
+
+        return elements
+
+    # ══════════════════════════════════════════════════════════════════════
     # CROSS-CAMERA WAGON ALIGNMENT (±3 drift fix)
     # ══════════════════════════════════════════════════════════════════════
 
@@ -1966,12 +2396,37 @@ class CombinedReportGenerator:
             right_side_damages=right_side_damages
         ))
 
+        # ──────────────────────────────────────────────────────────────
+        # WAGON-BY-WAGON 4-CAMERA VISUAL INSPECTION  (additive)
+        # ──────────────────────────────────────────────────────────────
+        # Appended AFTER everything above, so every existing section (header,
+        # summary, wagon table, Damaged Wagon Report + its feature snapshots)
+        # is emitted exactly as before.  Absent `wagon_overview` -> no-op.
+        wagon_overview = kwargs.get('wagon_overview') or {}
+        _n_overview = 0
+        if wagon_overview:
+            try:
+                _ov_elements = self._create_wagon_overview_pages(
+                    wagon_overview,
+                    missing_cameras=missing_cameras,
+                    camera_order=kwargs.get('camera_order'),
+                )
+                elements.extend(_ov_elements)
+                _n_overview = len(wagon_overview)
+            except Exception as e:
+                # Never let the new section prevent the existing report.
+                print(f"  ⚠ Wagon overview section failed, "
+                      f"report continues without it: {type(e).__name__}: {e}")
+
         # Build PDF
         doc.build(elements, onFirstPage=self._add_page_logo,
                   onLaterPages=self._add_page_logo)
 
         print(f"✓ Combined report generated: {self.output_path}")
         print(f"  Total wagons: {max_wagons}")
+        if _n_overview:
+            print(f"  Wagon overview pages: {_n_overview} "
+                  f"(4-camera centre snapshots)")
         print(f"  LEFT open: {left_open_count}, RIGHT open: {right_open_count}, "
               f"R-TOP damages: {top_open_count}, L-TOP damages: {left_top_open_count}")
         print(f"  Status: {status}")

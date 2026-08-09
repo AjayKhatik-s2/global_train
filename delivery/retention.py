@@ -21,7 +21,9 @@ When it is safe
 ---------------
 NOT before the batch is terminal.  While a batch is still active, a late camera
 triggers `stage_reports`, and the camera reports read quartile frames back out of
-`wagon_cache` -- pruning early would silently degrade those PDFs.  So pruning runs
+`wagon_cache` -- as does the combined report's wagon-by-wagon 4-camera overview
+section, which pulls one wagon-centre frame per (Global Wagon, camera) from the
+same cache.  Pruning early would silently degrade those PDFs.  So pruning runs
 only after `stage_finalize` has uploaded everything and the batch has reached a
 terminal state, and only for the SUCCESSFUL terminal states: a failed batch keeps
 its intermediates so the failure can still be diagnosed on the box.

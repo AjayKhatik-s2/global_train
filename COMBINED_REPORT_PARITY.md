@@ -1,5 +1,23 @@
 # Combined Report Parity — Proof of Identity (new pipeline vs old production)
 
+> **Amendment — wagon-by-wagon 4-camera visual inspection section.**
+> `combined_report_generator.py` is no longer byte-identical to the old
+> production file: it gained an **additive, opt-in** section (`OVERVIEW_CAMERA_ORDER`,
+> `_ov_*` helpers, `_create_wagon_overview_index`, `_create_wagon_overview_pages`)
+> plus a 15-line call site at the end of `generate()`. Everything the old code
+> emitted — header, VIDEO EVIDENCE, PARTIAL warning, DETAILED REPORTS, summary,
+> WAGON INSPECTION DETAILS, Damaged Wagon Report and its feature snapshots — is
+> **unchanged and still emitted first**; the new pages are appended after it.
+>
+> The gate is `kwargs.get('wagon_overview')`. With no payload (any caller that
+> does not pass one, and any batch built without a `cache_root`) the new code
+> contributes **zero flowables**, and the rendered PDF is **byte-identical** to
+> the pre-amendment output — re-verified under `reportlab.rl_config.invariant`:
+> `generate(...)`, `generate(..., wagon_overview={})` and
+> `generate(..., wagon_overview=None)` all produce the same md5.
+> Everything in §1–§3 below therefore still holds for the existing report body.
+> The four camera-wise report generators were not touched at all.
+
 **Question:** Is the combined PDF produced by the new Global-Train pipeline
 identical to the old production pipeline's combined report?
 

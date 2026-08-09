@@ -315,3 +315,220 @@ def split_for_combined(
         "top_data":      payloads.get(C.CAMERA_RIGHT_UP_TOP, {}),
         "left_top_data": payloads.get(C.CAMERA_LEFT_UP_TOP, {}),
     }
+
+
+# ---------------------------------------------------------------------------
+# Wagon-by-wagon 4-camera OVERVIEW evidence  (combined report only)
+# ---------------------------------------------------------------------------
+#
+# Additive layer on top of everything above: for every Global Wagon it resolves
+# ONE wagon-centre snapshot per camera plus that wagon's already-fused findings
+# and its already-selected feature evidence paths.  It computes NO detection, no
+# fusion and no scoring -- every value is read from `GlobalTrainState`,
+# `UnifiedWagonState` and the existing `_evidence_lookup` resolvers.
+#
+# The per-camera reports do not consume this; only the combined report does.
+
+# Panel order for the combined report's 2x2 wagon grid.  Matches the camera
+# ordering the combined report already uses everywhere else (header VIDEO
+# EVIDENCE table, DETAILED REPORTS table, WAGON INSPECTION DETAILS columns):
+#   top-left LEFT_UP | top-right RIGHT_UP | bottom-left R_UP_TOP | bottom-right L_UP_TOP
+# Identical on every wagon page; change here to change every page at once.
+OVERVIEW_CAMERA_ORDER = (
+    C.CAMERA_LEFT_UP,
+    C.CAMERA_RIGHT_UP,
+    C.CAMERA_RIGHT_UP_TOP,
+    C.CAMERA_LEFT_UP_TOP,
+)
+
+# Human label shown under/above each panel.
+OVERVIEW_NO_FRAME_LABEL = "NO FRAME AVAILABLE"
+
+_CLASS_DISPLAY = {
+    C.CLASS_ENGINE:    "ENGINE",
+    C.CLASS_WAGON:     "WAGON",
+    C.CLASS_BRAKE_VAN: "BRAKE VAN",
+}
+
+
+def _display_value(v: Any) -> str:
+    """Render a fused field for the wagon page without changing its meaning."""
+    s = "" if v is None else str(v)
+    return s if s else C.NO_DATA
+
+
+def _wagon_feature_evidence(
+    *, evidence_root: Optional[str], gw_id: str, u: Optional[UnifiedWagonState],
+) -> List[Dict[str, Any]]:
+    """The EXISTING feature-specific evidence snapshots for one wagon.
+
+    Pure re-resolution through `_evidence_lookup` of the very same slots the
+    combined report's Damaged Wagon Report and the camera-wise reports already
+    use -- these are surfaced ALONGSIDE the four overview panels, never in place
+    of them, and nothing here changes which frame a feature selected.
+    """
+    out: List[Dict[str, Any]] = []
+    if not evidence_root:
+        return out
+
+    for camera_id, side in ((C.CAMERA_LEFT_UP, "left"), (C.CAMERA_RIGHT_UP, "right")):
+        state = getattr(u, f"{side}_door", None) if u is not None else None
+        if not _is_detected(state):
+            continue
+        p = ev.evidence_snapshot(evidence_root, gw_id, "door", f"{side}_best",
+                                 camera_id=camera_id)
+        if p:
+            out.append({
+                "camera": camera_id, "feature": "door",
+                "label": f"{camera_id} - DOOR {_legacy_door_state(state)}",
+                "path": p,
+            })
+
+    for camera_id in C.TOP_CAMERAS:
+        for p, tr in ev.damage_track_snapshots(evidence_root, gw_id,
+                                               camera_id=camera_id):
+            cls = str(tr.get("class_name") or "damage").upper().replace("_", " ")
+            out.append({
+                "camera": camera_id, "feature": "damage",
+                "label": f"{camera_id} - {cls}",
+                "path": p,
+            })
+
+    ocr_p = ev.evidence_snapshot(evidence_root, gw_id, "ocr", "best_frame",
+                                 camera_id=C.CAMERA_RIGHT_UP)
+    if ocr_p:
+        ident = getattr(u, "wagon_identifier", None) if u is not None else None
+        suffix = f" {ident}" if _is_detected(ident) else ""
+        out.append({
+            "camera": C.CAMERA_RIGHT_UP, "feature": "ocr",
+            "label": f"{C.CAMERA_RIGHT_UP} - OCR{suffix}", "path": ocr_p,
+        })
+
+    load_p = ev.evidence_snapshot(evidence_root, gw_id, "load", "best_frame",
+                                  camera_id=C.CAMERA_RIGHT_UP_TOP)
+    if load_p:
+        ls = getattr(u, "load_status", None) if u is not None else None
+        suffix = f" {ls}" if _is_detected(ls) else ""
+        out.append({
+            "camera": C.CAMERA_RIGHT_UP_TOP, "feature": "load",
+            "label": f"{C.CAMERA_RIGHT_UP_TOP} - LOAD{suffix}", "path": load_p,
+        })
+
+    return out
+
+
+def build_wagon_overview(
+    *,
+    state: GlobalTrainState,
+    unified: Dict[str, UnifiedWagonState],
+    cache_root: Optional[str] = None,
+    evidence_root: Optional[str] = None,
+    per_camera_tracking_path: Optional[str] = None,
+    cameras: Sequence[str] = OVERVIEW_CAMERA_ORDER,
+    verbose: bool = True,
+) -> Dict[str, Dict[str, Any]]:
+    """Return `{gw_id -> wagon page payload}` for EVERY Global Wagon, in order.
+
+    The fused Global Wagon list (`state.wagons`) is the sole source of truth and
+    the Global Wagon ID is the only join key: each wagon's four panels are
+    resolved from that GW's own per-camera cache directory, so all four always
+    show the same physical wagon.  Cameras are never counted independently and
+    never aligned by index.
+
+    Each value carries an explicit `order` (1-based canonical Global Train
+    position) so the ordering survives any dict rebuild / JSON round-trip.
+
+    Returns `{}` when no `cache_root` was supplied -- i.e. the caller did not
+    wire the overview at all -- so the combined report renders exactly as it did
+    before this section existed.  A cache_root that exists but holds no frames
+    is a DIFFERENT case: the section is still rendered, with an explicit
+    NO FRAME AVAILABLE placeholder per camera, because the reviewer asked for
+    the wagon pages and needs to see that the evidence is missing.
+    """
+    if not cache_root:
+        if verbose:
+            print("[REPORT] wagon overview: no cache_root supplied -- "
+                  "skipping the wagon-by-wagon section")
+        return {}
+
+    per_cam_meta = ev.load_per_camera_meta(per_camera_tracking_path)
+    cameras = tuple(cameras)
+    out: Dict[str, Dict[str, Any]] = {}
+
+    for idx, gw in enumerate(state.wagons, start=1):
+        u = unified.get(gw.global_id)
+        cls = (u.classification if u is not None else gw.classification)
+
+        panels: Dict[str, Dict[str, Any]] = {}
+        log_bits: List[str] = []
+        for cam in cameras:
+            meta = per_cam_meta.get(cam, {})
+            sel = ev.center_cache_frame(
+                cache_root=cache_root,
+                gw_id=gw.global_id,
+                camera_id=cam,
+                wagon_start_time=gw.start_time,
+                wagon_end_time=gw.end_time,
+                local_fps=float(meta.get("fps") or 0.0),
+                local_total_frames=int(meta.get("total_frames") or 0),
+                gaps=meta.get("gaps") or (),
+            )
+            panels[cam] = sel
+            if sel["status"] == ev.OVERVIEW_OK:
+                log_bits.append(f"{cam}=frame {sel['frame']}")
+            else:
+                log_bits.append(f"{cam}={OVERVIEW_NO_FRAME_LABEL} ({sel['status']})")
+
+        if verbose:
+            print(f"[REPORT] {gw.global_id} overview: " + ", ".join(log_bits))
+
+        out[gw.global_id] = {
+            "order":          idx,
+            "global_id":      gw.global_id,
+            "wagon_number":   idx,
+            "classification": cls,
+            "classification_display": _CLASS_DISPLAY.get(cls, str(cls or "UNKNOWN")),
+            "classification_confidence": float(
+                (u.classification_confidence if u is not None
+                 else gw.classification_confidence) or 0.0),
+            # Boundaries, unchanged, straight from Stage 1.
+            "start_time":         float(gw.start_time),
+            "end_time":           float(gw.end_time),
+            "start_frame_master": int(gw.start_frame_master),
+            "end_frame_master":   int(gw.end_frame_master),
+            "supporting_cameras": list(gw.supporting_cameras or []),
+            # Already-fused findings, verbatim.
+            "findings": {
+                "wagon_identifier": _display_value(
+                    getattr(u, "wagon_identifier", None) if u is not None else None),
+                "left_door":   _display_value(
+                    getattr(u, "left_door", None) if u is not None else None),
+                "left_door_confidence": float(
+                    getattr(u, "left_door_confidence", 0.0) or 0.0) if u else 0.0,
+                "right_door":  _display_value(
+                    getattr(u, "right_door", None) if u is not None else None),
+                "right_door_confidence": float(
+                    getattr(u, "right_door_confidence", 0.0) or 0.0) if u else 0.0,
+                "load_status": _display_value(
+                    getattr(u, "load_status", None) if u is not None else None),
+                "top_damage":  _display_value(
+                    getattr(u, "top_damage", None) if u is not None else None),
+                "side_damage": _display_value(
+                    getattr(u, "side_damage", None) if u is not None else None),
+                "confidence":   float(getattr(u, "confidence", 0.0) or 0.0) if u else 0.0,
+                "result_state": str(getattr(u, "result_state", "") or "") if u else "",
+                "anomalies":    list(getattr(u, "anomalies", []) or []) if u else [],
+            },
+            # (1) four general wagon-centre overview panels ...
+            "cameras": panels,
+            # ... (2) and, separately, the existing feature-specific evidence.
+            "feature_evidence": _wagon_feature_evidence(
+                evidence_root=evidence_root, gw_id=gw.global_id, u=u),
+        }
+
+    if verbose:
+        n_ok = sum(1 for w in out.values()
+                   for p in w["cameras"].values() if p["status"] == ev.OVERVIEW_OK)
+        print(f"[REPORT] wagon overview: {len(out)} wagons, "
+              f"{n_ok}/{len(out) * len(cameras)} camera panels resolved")
+    return out

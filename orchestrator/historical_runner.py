@@ -642,21 +642,47 @@ def _dashboard_ingest(batch_root: str, outcome, s3_client) -> None:
 
 
 def _cleanup_inputs(batch_root: str, *, keep_inputs: bool) -> None:
-    """Drop the staged source clips after a SUCCESSFUL batch.
+    """Reclaim a SUCCESSFUL batch's local-only intermediates.
 
-    Only `downloads/` is removed -- reports, evidence, processed videos and the
-    wagon cache are left exactly as the pipeline wrote them.  A failed batch
-    keeps its inputs so the failure can be reproduced.
+    Reuses `delivery.retention.prune_batch_intermediates` -- the same call the
+    live path makes at finalize -- so the same set is dropped: `downloads/`,
+    `wagon_cache/`, `archive/`, `gap_cache/`.  Reports, evidence, processed
+    videos and the sealed state are kept exactly as the pipeline wrote them.
+
+    This matters far more here than in live mode: a bulk window is tens of
+    trains back to back, and a wagon cache is ~80% of a batch's several GB.
+    Without it a 12-hour re-run fills the disk after two or three trains.  The
+    combined report's wagon-overview panels read the cache DURING report
+    generation, which has already finished by this point.
+
+    A FAILED batch is never pruned -- its inputs and cache stay for diagnosis.
+    `--keep-inputs` keeps everything, and `WAGONEYE_PRUNE_INTERMEDIATES=false`
+    disables it globally, exactly as it does for the live path.
     """
+    staged = os.path.join(batch_root, CFG.DIR_DOWNLOADS)
     if keep_inputs:
-        log.info("[HISTORICAL] --keep-inputs: staged clips left at %s",
-                 os.path.join(batch_root, CFG.DIR_DOWNLOADS))
-        return
-    d = os.path.join(batch_root, CFG.DIR_DOWNLOADS)
-    if not os.path.isdir(d):
+        log.info("[HISTORICAL] --keep-inputs: staged clips + wagon cache left "
+                 "under %s", batch_root)
         return
     try:
-        shutil.rmtree(d)
-        log.info("[HISTORICAL] cleaned staged inputs: %s", d)
-    except OSError as e:
-        log.warning("[HISTORICAL] could not clean %s: %s", d, e)
+        from delivery import retention
+        if not retention.prune_intermediates_enabled():
+            log.info("[HISTORICAL] WAGONEYE_PRUNE_INTERMEDIATES=false -- "
+                     "intermediates kept at %s", batch_root)
+            return
+        freed = retention.prune_batch_intermediates(batch_root)
+        if freed:
+            log.info("[HISTORICAL] reclaimed %.2f GB from %s (%s)",
+                     sum(freed.values()) / 1e9, os.path.basename(batch_root),
+                     ", ".join(sorted(freed)))
+        return
+    except Exception as e:  # noqa: BLE001 -- reclaim must never fail a batch
+        log.warning("[HISTORICAL] retention unavailable (%s); removing only "
+                    "the staged clips", e)
+
+    if os.path.isdir(staged):
+        try:
+            shutil.rmtree(staged)
+            log.info("[HISTORICAL] cleaned staged inputs: %s", staged)
+        except OSError as e:
+            log.warning("[HISTORICAL] could not clean %s: %s", staged, e)

@@ -693,3 +693,48 @@ def test_dashboard_marker_seeds_pdf_urls_and_never_raises():
         HR._dashboard_ingest(root, _O(), None)      # must not raise
     finally:
         DI.run = orig
+
+
+def test_successful_batch_reclaims_the_wagon_cache():
+    """A bulk window is tens of trains; each keeps ~80% of its footprint in
+    wagon_cache/.  Success must reclaim it (same set the live path prunes);
+    failure and --keep-inputs must not."""
+    import orchestrator.master_runner as MR
+    objs = [_obj(cam, "20260808_101500") for cam in C.ALL_CAMERAS]
+    orig = MR.process_batch
+
+    def go(status, keep):
+        restore = _use_prefixes()
+        root = tempfile.mkdtemp()
+
+        def fake(**kw):
+            br = os.path.join(kw["workspace_root"], kw["batch"].batch_key)
+            for sub in (CFG.DIR_DOWNLOADS, CFG.DIR_WAGON_CACHE,
+                        CFG.DIR_REPORTS, CFG.DIR_EVIDENCE):
+                os.makedirs(os.path.join(br, sub), exist_ok=True)
+                open(os.path.join(br, sub, "f.bin"), "wb").write(b"x" * 16)
+            return _Outcome(status)
+
+        MR.process_batch = fake
+        try:
+            HR.run(s3_client=FakeS3(objs), window=_window(), workspace_root=root,
+                   recon_models_dir="/n", feat_models_dir="/n",
+                   keep_inputs=keep, verbose=False)
+        finally:
+            MR.process_batch = orig
+            restore()
+        br = os.path.join(root, HR.HISTORICAL_SUBDIR, "20260808_101500")
+        return {s: os.path.isdir(os.path.join(br, s))
+                for s in (CFG.DIR_DOWNLOADS, CFG.DIR_WAGON_CACHE,
+                          CFG.DIR_REPORTS, CFG.DIR_EVIDENCE)}
+
+    ok = go(C.BATCH_COMPLETED, False)
+    assert ok[CFG.DIR_DOWNLOADS] is False and ok[CFG.DIR_WAGON_CACHE] is False
+    assert ok[CFG.DIR_REPORTS] is True and ok[CFG.DIR_EVIDENCE] is True
+
+    kept = go(C.BATCH_COMPLETED, True)
+    assert kept[CFG.DIR_WAGON_CACHE] is True and kept[CFG.DIR_DOWNLOADS] is True
+
+    failed = go(C.BATCH_REPORT_FAILED, False)
+    assert failed[CFG.DIR_WAGON_CACHE] is True, "a failed batch keeps its cache"
+    assert failed[CFG.DIR_DOWNLOADS] is True

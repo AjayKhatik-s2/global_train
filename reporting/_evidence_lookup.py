@@ -185,6 +185,7 @@ OVERVIEW_OK               = "OK"
 OVERVIEW_NO_CACHE_ROOT    = "NO_CACHE_ROOT"
 OVERVIEW_NO_FRAMES        = "NO_FRAMES"
 OVERVIEW_NO_READABLE      = "NO_READABLE_FRAME"
+OVERVIEW_OUTSIDE_VIDEO    = "OUTSIDE_VIDEO_RANGE"
 
 
 def list_cache_frame_indices(
@@ -319,6 +320,20 @@ def center_cache_frame(
     sf: Optional[int] = None
     ef: Optional[int] = None
     if local_fps > 0 and local_total_frames > 0:
+        # UNCLAMPED first.  A camera whose clip was cut short never saw the tail
+        # of the rake at all.  `wagon_local_frames` (and Stage 2, which shares
+        # the arithmetic) CLAMPS such a wagon to the final frame, and the
+        # materializer's last-write-wins then hands that one real frame to
+        # whichever past-the-end wagon is numbered last -- so GW_49 would be
+        # illustrated with a frame showing some earlier wagon.  Refuse it: a
+        # wagon that begins at or after this camera's last frame has no frame
+        # here, and the page must say so rather than borrow another wagon's.
+        raw_sf = int(round(wagon_start_time * local_fps))
+        raw_ef = int(round(wagon_end_time * local_fps)) - 1
+        if raw_sf >= local_total_frames or raw_ef < 0:
+            res["status"] = OVERVIEW_OUTSIDE_VIDEO
+            res["start_frame"], res["end_frame"] = raw_sf, raw_ef
+            return res
         _sf, _ef = wagon_local_frames(
             wagon_start_time, wagon_end_time, local_fps, local_total_frames,
         )

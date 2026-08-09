@@ -322,6 +322,47 @@ def test_undecodable_center_falls_back_to_nearest_valid():
     assert bad["path"] is None and bad["frame"] is None
 
 
+def test_wagon_past_video_end_is_never_illustrated():
+    """A camera whose clip was cut short must report OUTSIDE_VIDEO_RANGE, not the
+    clamped final frame -- that frame shows an EARLIER wagon.
+
+    Reproduces the real batch: LEFT_UP_TOP ran 3120 frames while the rake ran to
+    GW_49.  Stage 2 clamps every past-the-end wagon to frame 3119 and its
+    last-write-wins gives that single frame to the last one, so GW_49's folder
+    genuinely contains frame 3119 -- of a wagon that passed ~60s earlier.
+    """
+    root = tempfile.mkdtemp()
+    cache = os.path.join(root, "wagon_cache")
+    folder = C.CAMERA_FOLDER[C.CAMERA_LEFT_UP_TOP]
+    # GW_49 spans 220.0-224.0s; the clip holds only 3120 frames (208.0s)
+    _jpeg(os.path.join(cache, "GW_49", folder, "frame_003119.jpg"))
+
+    sel = EL.center_cache_frame(
+        cache_root=cache, gw_id="GW_49", camera_id=C.CAMERA_LEFT_UP_TOP,
+        wagon_start_time=220.0, wagon_end_time=224.0,
+        local_fps=15.0, local_total_frames=3120)
+    assert sel["status"] == EL.OVERVIEW_OUTSIDE_VIDEO, sel
+    assert sel["path"] is None and sel["frame"] is None
+    assert sel["start_frame"] == 3300          # unclamped, so the reason is visible
+
+    # a wagon only PARTIALLY past the end still gets its genuine overlap
+    for fi in range(3079, 3120):
+        _jpeg(os.path.join(cache, "GW_38", folder, f"frame_{fi:06d}.jpg"))
+    ok = EL.center_cache_frame(
+        cache_root=cache, gw_id="GW_38", camera_id=C.CAMERA_LEFT_UP_TOP,
+        wagon_start_time=3079 / 15.0, wagon_end_time=3144 / 15.0,
+        local_fps=15.0, local_total_frames=3120)
+    assert ok["status"] == EL.OVERVIEW_OK
+    assert 3079 <= ok["frame"] <= 3119, ok
+
+    # and a wagon wholly before the clip starts is refused the same way
+    before = EL.center_cache_frame(
+        cache_root=cache, gw_id="GW_38", camera_id=C.CAMERA_LEFT_UP_TOP,
+        wagon_start_time=-8.0, wagon_end_time=-4.0,
+        local_fps=15.0, local_total_frames=3120)
+    assert before["status"] == EL.OVERVIEW_OUTSIDE_VIDEO
+
+
 def test_selection_is_deterministic():
     _root, st, cache, pcf = _fixture()
     a = _overview(st, cache, pcf)

@@ -120,23 +120,17 @@ class GapEvent:
             "hit_count": self.hit_count,
             "temporal_consistency_score": round(self.temporal_consistency_score, 4),
             "class_label": self.class_label,
-            # Per-hit image-plane trajectory of THIS gap track (already computed
-            # by the tracker; not part of reconstruction -- exposed so the
-            # processed-video renderer can replay the exact tracked-gap bbox on
-            # every frame without re-running Stage 1).  hit_frames[i] pairs with
-            # bbox_history[i] = [x1, y1, x2, y2].
-            "hit_frames": [int(f) for f in self.hit_frames],
-            "bbox_history": [[round(float(v), 2) for v in b] for b in self.bbox_history],
         }
 
     # -- lossless round-trip (per-camera gap cache) ---------------------------
     #
     # `to_dict` is the PUBLIC report shape (per_camera_tracking.json) and is
-    # deliberately lossy: it drops `center_x_trajectory` and `fps`, and rounds.
-    # The cache pair below is a strict superset used only to rebuild an
-    # identical in-memory GapEvent, so a cached camera is indistinguishable
-    # from one that was just inferred.  to_dict is NOT touched -- the public
-    # JSON stays byte-identical.
+    # deliberately lossy: it drops `center_x_trajectory`, `hit_frames`,
+    # `bbox_history`, and rounds.  The cache pair below is a strict superset
+    # used only to rebuild an identical in-memory GapEvent, so a camera loaded
+    # from the incremental gap cache is indistinguishable from one that was
+    # just inferred.  to_dict is NOT touched -- the public JSON stays
+    # byte-identical.
 
     def to_cache_dict(self) -> Dict[str, Any]:
         return {
@@ -199,16 +193,7 @@ class _MasterClassification:
             "confidence": round(self.confidence, 4),
         }
 
-    @classmethod
-    def from_cache_dict(cls, d: Dict[str, Any]) -> "_MasterClassification":
-        """Unrounded round-trip for the per-camera gap cache."""
-        return cls(
-            segment_index=int(d["segment_index"]),
-            start_frame=int(d["start_frame"]),
-            end_frame=int(d["end_frame"]),
-            label=str(d["label"]),
-            confidence=float(d["confidence"]),
-        )
+    # -- lossless round-trip (per-camera gap cache) --------------------------
 
     def to_cache_dict(self) -> Dict[str, Any]:
         return {
@@ -216,8 +201,18 @@ class _MasterClassification:
             "start_frame": self.start_frame,
             "end_frame": self.end_frame,
             "label": self.label,
-            "confidence": self.confidence,
+            "confidence": self.confidence,      # unrounded
         }
+
+    @classmethod
+    def from_cache_dict(cls, d: Dict[str, Any]) -> "_MasterClassification":
+        return cls(
+            segment_index=int(d["segment_index"]),
+            start_frame=int(d["start_frame"]),
+            end_frame=int(d["end_frame"]),
+            label=str(d["label"]),
+            confidence=float(d["confidence"]),
+        )
 
 
 @dataclass
@@ -327,11 +322,6 @@ class GlobalWagon:
     end_time: float
     classification: str = SegmentClass.UNKNOWN
     classification_confidence: float = 0.0
-    # Per-camera semantic votes that produced `classification` (RIGHT_UP via
-    # side_classification.pt + the two TOP cameras via top_classification.pt).
-    # Audit only -- downstream keys off `classification`, which is unchanged in
-    # shape.  Empty when no top evidence was available.
-    classification_sources: Dict[str, Any] = field(default_factory=dict)
     supporting_cameras: List[str] = field(default_factory=list)
     # Provenance: was this wagon created by inserting a recovered gap?
     split_from_global_id: Optional[str] = None
@@ -354,7 +344,6 @@ class GlobalWagon:
             "duration": round(self.duration, 4),
             "classification": self.classification,
             "classification_confidence": round(self.classification_confidence, 4),
-            "classification_sources": dict(self.classification_sources),
             "supporting_cameras": list(self.supporting_cameras),
             "split_from_global_id": self.split_from_global_id,
             "leading_gap": self.leading_gap,
@@ -416,25 +405,33 @@ class GlobalTrainState:
     fallback_used: bool = False
     fallback_reason: str = ""
 
-    # Travel direction of the rake across the master camera's image plane:
-    # 'left-to-right' | 'right-to-left' | 'unknown'  (same vocabulary the V4
-    # Train-Inspection-Engine's optical-flow detector emits, so the per-camera
-    # inspection JSON reports it identically).  Derived from the sign of the gap
-    # tracks' centre_x drift -- data the tracker already produced, so this costs
-    # nothing extra and needs no video re-read.
+    # Free-form notes from the runner
+    notes: List[str] = field(default_factory=list)
+
+    # -------------------------------------------------------------------------
+    # WagonEye downstream contract (NOT part of the reference Phase-1 schema).
+    #
+    # These are consumed by `core.global_state_loader.GlobalTrainState` and the
+    # incremental lifecycle.  They are additive and every one has a safe default,
+    # so a state produced without them still loads -- but they are populated here
+    # because real consumers read them:
+    #   travel_direction  -> delivery/inspection_json `direction` + side
+    #                        `rake_status` on the V1 dashboard feed.
+    #   participating_/missing_/support_* + reconstruction_* + sealed_*
+    #                     -> orchestrator/lifecycle_runner report metadata and
+    #                        the master-first incremental reconstruction audit.
+    # -------------------------------------------------------------------------
+
+    #: 'left-to-right' | 'right-to-left' | 'unknown' -- see
+    #: `global_alignment.travel_direction`.
     travel_direction: str = "unknown"
 
-    # ---- Master-first incremental reconstruction provenance (v4 lifecycle) ----
-    # Which cameras actually participated when this state was SEALED, and which
-    # were missing at that moment.  A late camera enriches features later but
-    # NEVER changes any of these.
+    #: {camera_id -> how that camera's segment labels were obtained}
+    classification_sources: Dict[str, Any] = field(default_factory=dict)
+
     participating_cameras: List[str] = field(default_factory=list)
     missing_at_reconstruction: List[str] = field(default_factory=list)
-    # MASTER_ONLY | MASTER_WITH_SUPPORT_AVAILABLE | MASTER_WITH_FUSED_SUPPORT
     reconstruction_mode: str = ""
-    # Support present is NOT the same as support used: a gap is only recovered
-    # when >=2 support cameras agree (insert_min_support), recorded as a
-    # GapCorrection.  support_fusion_used == (support_gap_recoveries > 0).
     support_cameras_present: List[str] = field(default_factory=list)
     support_fusion_used: bool = False
     support_gap_recoveries: int = 0
@@ -443,8 +440,108 @@ class GlobalTrainState:
     sealed_at: str = ""
     sealing_reason: str = ""
 
-    # Free-form notes from the runner
-    notes: List[str] = field(default_factory=list)
+    # -------------------------------------------------------------------------
+    # Fixed-master fusion block (global_fusion.py).  All fields are additive and
+    # default to empty, so consumers written against the original schema keep
+    # working unchanged.
+    #
+    # The distinction these fields exist to make explicit:
+    #   global_gaps[i]["master_*"]              -> THE master gap (authoritative)
+    #   global_gaps[i]["support_observations"]  -> evidence children of that gap
+    #   global_gaps[i]["missing_cameras"]       -> in range, did not observe it
+    #   global_gaps[i]["unavailable_cameras"]   -> no footage / unresolved offset
+    #   extra_support_observations              -> support detections matching NO
+    #                                              global gap.  Diagnostic only:
+    #                                              they never become global gaps.
+    # -------------------------------------------------------------------------
+    fusion_mode: str = ""
+    """'master-fixed' (RIGHT_UP authoritative) or 'legacy' (pre-existing path)."""
+
+    global_gaps: List[Dict[str, Any]] = field(default_factory=list)
+    """The authoritative global gap sequence. Under master-fixed fusion this has
+    exactly len(RIGHT_UP gaps) entries, each with a RIGHT_UP source."""
+
+    camera_offsets: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    """Per-camera t_global = t_local + delta, with RESOLVED/UNRESOLVED status.
+    Used for evidence association only -- never for counting."""
+
+    support_alignment_summary: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    """Per support camera: MATCH / MISSING / EXTRA counts and alignment cost."""
+
+    extra_support_observations: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    """Support detections that correspond to no global gap. Diagnostics only."""
+
+    interval_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    """Suspicious wagon intervals (report only; the master sequence is final)."""
+
+    invariant_checks: Dict[str, Any] = field(default_factory=dict)
+    """Machine-readable result of the fixed-master invariant assertions."""
+
+    # -------------------------------------------------------------------------
+    # Train structure + gap validation (wagon-only counting).
+    #
+    #   ENGINE and BRAKE_VAN are real train objects and are preserved here, but
+    #   they never receive a GW id and never extend the wagon timeline.
+    #   `wagons` therefore contains WAGON units only.
+    # -------------------------------------------------------------------------
+    master_wagon_count: int = 0
+    """Number of WAGON units in the master's wagon window == total_wagons."""
+
+    wagon_window: Dict[str, Any] = field(default_factory=dict)
+    """first/last wagon, wagon_start/end frame+time, and the leading / trailing /
+    interior non-wagon objects (engines, brake vans) that were excluded."""
+
+    support_wagon_regions: Dict[str, Any] = field(default_factory=dict)
+    """Each support camera's own local wagon region, used to keep engine and
+    brake-van observations out of wagon synchronization."""
+
+    gap_validation_statistics: Dict[str, Any] = field(default_factory=dict)
+    """Per camera: raw detections -> tracked candidates -> valid gap events,
+    with counts per rejection reason."""
+
+    gap_rejection_details: Dict[str, Any] = field(default_factory=dict)
+    """Per camera: every rejected candidate with its reason and measured motion
+    features. Nothing is discarded silently."""
+
+    wagon_active_recovery: Dict[str, Any] = field(default_factory=dict)
+    """Second-pass recovery of soft-failed candidates inside the wagon window:
+    how many were considered, recovered, or blocked by a hard gate, with the
+    evidence for each decision."""
+
+    gap_validation_config: Dict[str, Any] = field(default_factory=dict)
+
+    inspection: Dict[str, Any] = field(default_factory=dict)
+    """Downstream inspection findings (door state, top damage), keyed by the GW
+    ids this state already contains.
+
+    Purely ADDITIVE: every pre-existing field keeps its meaning, and an empty
+    dict means inspection did not run. Nothing here participates in the count --
+    it annotates wagons that fusion already finalized."""
+
+    fragment_stitching: Dict[str, Any] = field(default_factory=dict)
+    """Per camera: which tracker fragments were reassembled into one physical gap
+    before validation ran, plus the seams that were considered and refused.
+
+    Recorded so a lost gap can be traced without re-running the tracker: a gap
+    that should have been reassembled but was not will appear in
+    `rejected_seams` with the criterion that refused it."""
+    """The exact thresholds used, so a run is reproducible and auditable."""
+
+    classification_model_by_camera: Dict[str, str] = field(default_factory=dict)
+    """Which classification model each camera used."""
+
+    temporal_classification: Dict[str, Any] = field(default_factory=dict)
+    """Per camera: raw vs stable class counts, every accepted AND rejected class
+    transition with its evidence, and the smoothed stable class intervals.
+    FIRST_VALID_WAGON / LAST_VALID_WAGON are derived from these intervals, never
+    from a single observation."""
+
+    temporal_classification_config: Dict[str, Any] = field(default_factory=dict)
+    """The hysteresis parameters used, so a run is reproducible."""
+
+    top_classification_model_info: Dict[str, Any] = field(default_factory=dict)
+    """The top model's REAL class names and the semantic mapping derived from
+    them, including any unexpected classes (mapped to UNKNOWN, never WAGON)."""
 
     def add_note(self, text: str) -> None:
         self.notes.append(text)
@@ -479,7 +576,10 @@ class GlobalTrainState:
             "corrections_applied": [c.to_dict() for c in self.corrections_applied],
             "fallback_used": self.fallback_used,
             "fallback_reason": self.fallback_reason,
+            "notes": list(self.notes),
+            # ---- WagonEye downstream contract (see the field block above) ----
             "travel_direction": self.travel_direction,
+            "classification_sources": dict(self.classification_sources),
             "participating_cameras": list(self.participating_cameras),
             "missing_at_reconstruction": list(self.missing_at_reconstruction),
             "reconstruction_mode": self.reconstruction_mode,
@@ -490,7 +590,32 @@ class GlobalTrainState:
             "fallback_master_used": self.fallback_master_used,
             "sealed_at": self.sealed_at,
             "sealing_reason": self.sealing_reason,
-            "notes": list(self.notes),
+            # ---- fixed-master fusion block (empty under legacy fusion) ----
+            "fusion_mode": self.fusion_mode,
+            "right_up_final_gap_count": self.invariant_checks.get(
+                "right_up_final_gap_count", self.per_camera_gap_counts.get(
+                    self.master_camera)),
+            "global_gap_count": len(self.global_gaps) or None,
+            "invariant_checks": dict(self.invariant_checks),
+            "camera_offsets": dict(self.camera_offsets),
+            "support_alignment_summary": dict(self.support_alignment_summary),
+            "interval_diagnostics": list(self.interval_diagnostics),
+            "extra_support_observations": dict(self.extra_support_observations),
+            "global_gaps": list(self.global_gaps),
+            # ---- train structure + gap validation ----
+            "master_wagon_count": self.master_wagon_count,
+            "wagon_window": dict(self.wagon_window),
+            "support_wagon_regions": dict(self.support_wagon_regions),
+            "classification_model_by_camera": dict(self.classification_model_by_camera),
+            "top_classification_model_info": dict(self.top_classification_model_info),
+            "temporal_classification": dict(self.temporal_classification),
+            "temporal_classification_config": dict(self.temporal_classification_config),
+            "gap_validation_statistics": dict(self.gap_validation_statistics),
+            "gap_validation_config": dict(self.gap_validation_config),
+            "fragment_stitching": dict(self.fragment_stitching),
+            "inspection": dict(self.inspection),
+            "wagon_active_recovery": dict(self.wagon_active_recovery),
+            "gap_rejection_details": dict(self.gap_rejection_details),
         }
 
     def to_json(self, indent: int = 2) -> str:
@@ -518,6 +643,44 @@ def summarize_state(state: GlobalTrainState) -> str:
         st = state.per_camera_status.get(cam, "—")
         lines.append(f"    {cam:<14}  wagons={wc}   gaps={gc}   [{st}]")
     lines.append("")
+    if state.fusion_mode == "master-fixed":
+        chk = state.invariant_checks or {}
+        lines.append("  Fusion mode          : master-fixed "
+                     "(RIGHT_UP gaps are complete and final)")
+        lines.append(f"  RIGHT_UP final gaps  : {chk.get('right_up_final_gap_count', '—')}")
+        lines.append(f"  GLOBAL gaps          : {chk.get('global_gap_count', '—')}"
+                     f"   [invariant {'OK' if chk.get('invariant_holds') else 'VIOLATED'}]")
+        if chk.get("collapsed_boundaries"):
+            lines.append(f"  collapsed boundaries : {chk['collapsed_boundaries']} "
+                         f"(two gaps rounded to the same master frame)")
+        for cam in ALL_CAMERAS:
+            if cam == state.master_camera:
+                continue
+            off = state.camera_offsets.get(cam)
+            al = state.support_alignment_summary.get(cam)
+            if not off:
+                continue
+            if off.get("status") == "RESOLVED":
+                lines.append(f"    {cam:<14} delta={off['delta']:+7.2f}s  "
+                             f"MATCH={al['n_match'] if al else '—'}  "
+                             f"MISSING={al['n_missing'] if al else '—'}  "
+                             f"EXTRA={al['n_extra'] if al else '—'}")
+            else:
+                lines.append(f"    {cam:<14} offset {off.get('status')} "
+                             f"-> no evidence contributed (count unaffected)")
+        n_extra = sum(len(v) for v in state.extra_support_observations.values())
+        lines.append(f"  EXTRA support obs    : {n_extra} "
+                     f"(diagnostic only; created 0 global gaps)")
+        if state.interval_diagnostics:
+            n_short = sum(1 for d in state.interval_diagnostics
+                          if d.get("flag") == "SUSPICIOUSLY_SHORT")
+            n_long = sum(1 for d in state.interval_diagnostics
+                         if d.get("flag") == "POSSIBLE_MISSING_GAP")
+            lines.append(f"  Interval diagnostics : {n_short} suspiciously short, "
+                         f"{n_long} possibly-missing gap(s)")
+            lines.append("                         (REPORT ONLY -- the RIGHT_UP "
+                         "sequence was not modified)")
+        lines.append("")
     lines.append(f"  Corrections applied  : {len(state.corrections_applied)}")
     for c in state.corrections_applied:
         lines.append(
@@ -527,10 +690,36 @@ def summarize_state(state: GlobalTrainState) -> str:
             f"conf={c.mean_confidence:.2f}  spread={c.time_spread_sec:.2f}s"
         )
     lines.append("")
-    lines.append(f"  FINAL FUSED WAGON COUNT : {state.total_wagons}")
-    lines.append(f"     regular wagons       : {state.regular_wagon_count}")
-    lines.append(f"     engines              : {state.engine_count}")
-    lines.append(f"     brake vans           : {state.brake_van_count}")
+    if state.wagon_window:
+        ww = state.wagon_window
+        lines.append("  TRAIN STRUCTURE (only WAGONs are counted):")
+        lines.append(f"     leading non-wagon    : "
+                     f"{ww.get('leading_non_wagon_classes') or 'none'}")
+        lines.append(f"     WAGON region         : "
+                     f"{ww.get('first_wagon') or '-'} .. {ww.get('last_wagon') or '-'}"
+                     f"   frames {ww.get('wagon_start_frame')}-"
+                     f"{ww.get('wagon_end_frame')}")
+        lines.append(f"     trailing non-wagon   : "
+                     f"{ww.get('trailing_non_wagon_classes') or 'none'}")
+        if ww.get("interior_non_wagon_count"):
+            lines.append(f"     excluded inside      : "
+                         f"{ww.get('interior_non_wagon_classes')}")
+        lines.append("     (ENGINE / BRAKE_VAN are preserved above but never "
+                     "receive a GW id)")
+        lines.append("")
+    lines.append(f"  FINAL GLOBAL WAGON COUNT : {state.total_wagons}")
+    if state.wagon_window:
+        lines.append(f"     GW ids               : GW_1 .. GW_{state.total_wagons}")
+        lines.append(f"     classified WAGON     : {state.regular_wagon_count}")
+        unknown_in = (state.total_wagons - state.regular_wagon_count
+                      - state.engine_count - state.brake_van_count)
+        if unknown_in:
+            lines.append(f"     unlabelled (counted) : {unknown_in}  "
+                         f"(between two wagons, so physically a vehicle)")
+    else:
+        lines.append(f"     regular wagons       : {state.regular_wagon_count}")
+        lines.append(f"     engines              : {state.engine_count}")
+        lines.append(f"     brake vans           : {state.brake_van_count}")
     if state.fallback_used:
         lines.append(f"  ⚠ FALLBACK USED       : {state.fallback_reason}")
     lines.append("=" * 70)

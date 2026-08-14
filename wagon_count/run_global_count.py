@@ -87,6 +87,17 @@ import global_alignment as ga
 import video_segmenter as vs
 import gap_cache as gc
 
+# ---- Global Train construction (ported from wagon_count_global) --------------
+# These five modules ARE the replacement: they sit between gap tracking and
+# segmentation, and they are the reason the reference counts wagons correctly.
+# Our tracker/alignment/segmenter were AST-compared against the reference's and
+# proved supersets (0 functions present there and absent here), so they stay.
+import fragment_stitching as fstitch      # STEP 1a  rejoin fragmented gap tracks
+import gap_validation as gval             # STEP 1b  candidate -> valid boundary
+import temporal_classification as tcls    # STEP 2b  support-camera labels
+import train_structure as ts              # STEP 3   wagon window + GW renumber
+import global_fusion as gf                # STEP 3   master-fixed fusion
+
 
 # =============================================================================
 # Auto-discovery: default file conventions
@@ -501,6 +512,80 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--classification-samples", type=int, default=5,
                    help="Frames per segment for side_classification.pt vote (default: 5)")
 
+    # ---- fragment reassembly: rebuild physical gaps before validating them ---
+    # Defaults are taken from the ported modules themselves, so this CLI can
+    # never drift from the algorithm's own tuned values.
+    _fs = fstitch.DEFAULT_FRAGMENT_STITCH
+    p.add_argument("--no-fragment-stitching", action="store_true",
+                   help="Disable fragment reassembly and validate each tracker "
+                        "fragment separately.  One physical gap split across "
+                        "several short tracks is then rejected piece by piece.")
+    p.add_argument("--stitch-max-seam-sec", type=float,
+                   default=_fs.max_seam_seconds,
+                   help=f"Largest temporal hole between two fragments of the "
+                        f"same physical gap, in SECONDS "
+                        f"(default {_fs.max_seam_seconds})")
+    p.add_argument("--stitch-seam-tolerance", type=float,
+                   default=_fs.seam_speed_tolerance,
+                   help=f"How far a seam jump may exceed what the local advance "
+                        f"rate predicts (default {_fs.seam_speed_tolerance})")
+    p.add_argument("--stitch-max-seam-frac", type=float,
+                   default=_fs.max_seam_frac,
+                   help=f"Hard cap on seam displacement as a FRACTION of frame "
+                        f"width (default {_fs.max_seam_frac})")
+
+    # ---- gap validation: raw YOLO gaps are CANDIDATES, not boundaries --------
+    _gv = gval.DEFAULT_GAP_VALIDATION
+    p.add_argument("--no-gap-validation", action="store_true",
+                   help="Disable motion/temporal gap validation and treat every "
+                        "tracked candidate as a wagon boundary (the behaviour "
+                        "before the wagon_count_global replacement)")
+    p.add_argument("--gap-min-track-sec", type=float,
+                   default=_gv.min_track_seconds)
+    p.add_argument("--gap-max-track-gap-sec", type=float,
+                   default=_gv.max_detection_gap_seconds)
+    p.add_argument("--gap-min-motion-frac", type=float,
+                   default=_gv.min_motion_frac)
+    p.add_argument("--gap-static-max-frac", type=float,
+                   default=_gv.static_max_motion_frac)
+    p.add_argument("--gap-min-motion-frac-sec", type=float,
+                   default=_gv.min_motion_frac_per_sec)
+    p.add_argument("--gap-max-motion-frac-sec", type=float,
+                   default=_gv.max_motion_frac_per_sec)
+    p.add_argument("--gap-min-separation-sec", type=float,
+                   default=_gv.min_separation_seconds)
+    p.add_argument("--gap-motion-tolerance", type=float,
+                   default=_gv.train_motion_tolerance)
+    p.add_argument("--gap-min-confidence", type=float,
+                   default=_gv.min_mean_confidence)
+    p.add_argument("--gap-min-monotonic", type=float,
+                   default=_gv.min_monotonic_fraction)
+
+    # ---- master-fixed cross-camera fusion -----------------------------------
+    p.add_argument("--no-wagon-only", action="store_true",
+                   help="Align support cameras over their whole footage instead "
+                        "of only their wagon region.")
+    p.add_argument("--fusion-non-strict", action="store_true",
+                   help="Downgrade master-fixed fusion invariant violations from "
+                        "errors to warnings.")
+    p.add_argument("--offset-search", type=float,
+                   default=gf.DEFAULT_CONFIG.offset_search_s,
+                   help="Half-width of the per-camera clock-offset search, in "
+                        f"seconds (default {gf.DEFAULT_CONFIG.offset_search_s})")
+    p.add_argument("--offset-min-margin", type=float,
+                   default=gf.DEFAULT_CONFIG.offset_min_margin_ratio,
+                   help="Minimum margin between the best and runner-up offset "
+                        "for it to count as RESOLVED "
+                        f"(default {gf.DEFAULT_CONFIG.offset_min_margin_ratio})")
+    p.add_argument("--match-tolerance", type=float,
+                   default=gf.DEFAULT_CONFIG.match_tolerance_s,
+                   help="How close an aligned support gap must be to a master "
+                        f"gap to match (default {gf.DEFAULT_CONFIG.match_tolerance_s}s)")
+
+    # ---- DEPRECATED: trust-weighted insertion (pre-replacement fusion) -------
+    # Kept only so existing callers/scripts do not crash on an unknown flag.
+    # Master-fixed fusion never inserts a support-derived gap, so these have NO
+    # effect; passing one is reported once at startup.
     p.add_argument("--fuse-min-support", type=int, default=2,
                    help="Min supporting cameras for inserting a missed gap (default: 2)")
     p.add_argument("--fuse-max-spread",  type=float, default=1.5,
@@ -691,6 +776,100 @@ def main(argv: Optional[List[str]] = None) -> int:
     print()
 
     # ------------------------------------------------------------------
+    # STEP 1a -- FRAGMENT REASSEMBLY  (before validation, not inside it)
+    #
+    # One physical gap can leave the tracker as several short tracks: when a
+    # detection is missed the object reappears beyond the association gate, so
+    # the track closes and a new id opens.  Validation would then judge each
+    # piece separately, reject each as too short, and lose the gap they jointly
+    # prove.  Reassembly restores the physical object FIRST, so every existing
+    # gate then applies to the whole gap.  Nothing is accepted here and no
+    # threshold is relaxed -- this layer only decides which observations belong
+    # together.
+    #
+    # Runs over PRESENT cameras only (the reference assumes all four).
+    # ------------------------------------------------------------------
+    print("-" * 70)
+    print("  STEP 1a  Fragment reassembly (tracker fragments -> physical gaps)")
+    print("-" * 70)
+    stitch_cfg = fstitch.FragmentStitchConfig(
+        enabled=not args.no_fragment_stitching,
+        max_seam_seconds=float(args.stitch_max_seam_sec),
+        seam_speed_tolerance=float(args.stitch_seam_tolerance),
+        max_seam_frac=float(args.stitch_max_seam_frac),
+    )
+    stitching: Dict[str, fstitch.StitchResult] = {}
+    for cam in ALL_CAMERAS:
+        if cam not in tracks:
+            continue
+        t = tracks[cam]
+        # Geometry per camera: seam limits resolve from THIS camera's own width
+        # and frame rate, so nothing measured on one geometry leaks into another.
+        sres = fstitch.reassemble_fragments(
+            t.gaps, cam, stitch_cfg, frame_width=t.width, fps=t.fps,
+            verbose=verbose)
+        stitching[cam] = sres
+        t.gaps = sres.events
+    print()
+
+    # ------------------------------------------------------------------
+    # STEP 1b -- GAP VALIDATION
+    #
+    # A raw YOLO gap detection is a CANDIDATE, not a wagon boundary.  Each
+    # tracked candidate is checked for temporal persistence, detection
+    # continuity, real motion, plausible speed, trajectory consistency,
+    # direction and confidence, and duplicates are collapsed.  The train is
+    # moving, so a detection pinned to one pixel column is background, not a
+    # gap between wagons.
+    #
+    # Detection and tracking themselves are UNCHANGED: this filters the
+    # GapEvents the existing tracker already emitted.
+    # ------------------------------------------------------------------
+    print("-" * 70)
+    print("  STEP 1b  Gap validation (candidates -> valid wagon boundaries)")
+    print("-" * 70)
+    # Config holds ONLY camera-independent units (seconds / frame-width
+    # fractions / ratios); per-camera geometry is applied at resolve() time.
+    gv_cfg = gval.GapValidationConfig(
+        enabled=not args.no_gap_validation,
+        min_track_seconds=float(args.gap_min_track_sec),
+        max_detection_gap_seconds=float(args.gap_max_track_gap_sec),
+        min_motion_frac=float(args.gap_min_motion_frac),
+        static_max_motion_frac=float(args.gap_static_max_frac),
+        min_motion_frac_per_sec=float(args.gap_min_motion_frac_sec),
+        max_motion_frac_per_sec=float(args.gap_max_motion_frac_sec),
+        min_separation_seconds=float(args.gap_min_separation_sec),
+        min_monotonic_fraction=float(args.gap_min_monotonic),
+        min_mean_confidence=float(args.gap_min_confidence),
+        train_motion_tolerance=float(args.gap_motion_tolerance),
+    )
+    gap_validation: Dict[str, gval.GapValidationResult] = {}
+    for cam in ALL_CAMERAS:
+        if cam not in tracks:
+            continue
+        t = tracks[cam]
+        raw_n = sum(len(v) for v in (t.raw_frame_detections or {}).values())
+        res = gval.validate_gap_events(t.gaps, cam, gv_cfg,
+                                       raw_detection_count=raw_n, verbose=verbose,
+                                       frame_width=t.width, fps=t.fps)
+        gap_validation[cam] = res
+        # Replace the camera's gap list with the validated subset and restore
+        # track_id as a contiguous temporal rank, as the tracker produces.
+        t.gaps = gval.renumber_gap_events(res.accepted)
+
+    print()
+    print("  Validated counts after Step 1b:")
+    for cam in ALL_CAMERAS:
+        if cam not in tracks:
+            continue
+        t = tracks[cam]
+        r = gap_validation[cam]
+        print(f"    {cam:<14}  raw_det={r.raw_detection_count:>4}  "
+              f"candidates={r.tracked_candidate_count:>3}  "
+              f"valid_gaps={len(t.gaps):>3}  rejected={len(r.rejected):>3}")
+    print()
+
+    # ------------------------------------------------------------------
     # STEP 2 -- master classification (on the chosen master video)
     # ------------------------------------------------------------------
     print("-" * 70)
@@ -762,25 +941,63 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("-" * 70)
     support = [tracks[c] for c in ALL_CAMERAS if c in tracks and c != master_cam]
     support_present = [c for c in ALL_CAMERAS if c in tracks and c != master_cam]
-    fuse_cfg = dict(ga.PHASE1_DEFAULTS)
-    fuse_cfg.update({
-        "insert_min_support": int(args.fuse_min_support),
-        "insert_max_spread_sec": float(args.fuse_max_spread),
-        "insert_min_confidence": float(args.fuse_min_conf),
-    })
 
-    state: GlobalTrainState = ga.assemble_global_train_state(
+    # Per-support-camera wagon regions (reference STEP 2b).  NOT YET WIRED:
+    # `train_structure.build_local_wagon_region` needs the support cameras' own
+    # semantic labels, which our STEP 2b produces in a different shape than the
+    # reference's `temporal_classification`.  Empty means each support camera is
+    # aligned over its whole footage -- the same as passing --no-wagon-only.
+    # This affects EVIDENCE ASSOCIATION only: under master-fixed fusion the
+    # wagon COUNT is the master's validated gap count either way.
+    support_regions: Dict[str, ts.LocalWagonRegion] = {}
+
+    # MASTER-FIXED FUSION -- the single authoritative construction path.
+    #
+    # The global gap sequence IS the master's validated gap sequence.  Support
+    # cameras are aligned to it only to attach evidence: they cannot create,
+    # delete, split or merge a global gap, so the wagon count is independent of
+    # both the support detections and the camera-offset estimation.
+    #
+    # This REPLACES the previous trust-weighted fusion, in which >=2 agreeing
+    # support cameras could INSERT a master gap and therefore change the wagon
+    # count.  `global_alignment.assemble_global_train_state` is deliberately no
+    # longer called from anywhere -- there is exactly one algorithm here now.
+    fusion_cfg = gf.FusionConfig(
+        offset_search_s=float(args.offset_search),
+        offset_min_margin_ratio=float(args.offset_min_margin),
+        match_tolerance_s=float(args.match_tolerance),
+        strict_invariants=not args.fusion_non_strict,
+    )
+    state: GlobalTrainState = gf.assemble_global_train_state_master_fixed(
         master_tracks=master,
         support_tracks=support,
         initial_classifications=initial_classifications,
-        top_classifications=top_classifications,
-        config=fuse_cfg,
+        config=fusion_cfg,
         verbose=verbose,
+        wagon_regions=support_regions,
+        wagon_only=not args.no_wagon_only,
     )
 
+    # ---- validation / stitching diagnostics onto the state ----
+    state.gap_validation_statistics = {
+        cam: gap_validation[cam].to_dict(include_rejections=False)
+        for cam in ALL_CAMERAS if cam in gap_validation
+    }
+    state.gap_rejection_details = {
+        cam: gap_validation[cam].to_dict(include_rejections=True)["rejections"]
+        for cam in ALL_CAMERAS
+        if cam in gap_validation and gap_validation[cam].rejected
+    }
+    state.gap_validation_config = gv_cfg.describe()
+    state.fragment_stitching = {
+        cam: stitching[cam].to_dict()
+        for cam in ALL_CAMERAS if cam in stitching
+    }
+
     # ---- Master-first reconstruction provenance ----
-    # A gap is only RECOVERED when >=2 support cameras agree (insert_min_support),
-    # emitted as a GapCorrection.  Support present != support used.
+    # Under master-fixed fusion support cameras never insert a gap, so recoveries
+    # is always 0 and `support_fusion_used` is False by construction.  The fields
+    # are kept because lifecycle_runner + the report metadata read them.
     recoveries = len(state.corrections_applied)
     if not support_present:
         recon_mode = "MASTER_ONLY"

@@ -926,3 +926,11 @@ def assemble_global_train_state(
         notes=notes,
     )
     return state
+
+
+# -----------------------------------------------------------------------------
+# Travel direction  (WagonEye downstream contract)
+# -----------------------------------------------------------------------------
+# Retained from the pre-replacement Stage 1: consumed by delivery/inspection_json
+# (`direction`, and the side-camera `rake_status` derived from it) and by the
+# combined report JSON.  The reference Phase-1 implementation has no equivalent.

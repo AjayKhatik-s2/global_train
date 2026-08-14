@@ -1082,6 +1082,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         report = model_sync.ensure_models_or_report(
             enabled_features=feature_config.enabled_keys(),
             s3_client=None, download=True,
+            # Historical mode never builds an ExtractionManager, so the
+            # raw->trimmed classifiers are not required -- and they cannot be
+            # auto-synced anyway (side_classification.pt / top_classification.pt
+            # exist in more than one model category with different weights, and
+            # the flat S3 layout cannot disambiguate them).  Same exemption
+            # validate_config makes for mode="historical".
+            include_extraction=(False if args.historical else None),
         )
         if not report.ok:
             log.error("[MODEL_SYNC] %d required model(s) unavailable -- refusing "

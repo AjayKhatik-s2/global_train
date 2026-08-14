@@ -792,3 +792,25 @@ def test_cluster_anchor_chains_from_the_latest_member():
     split = chained[:2] + [cv(C.CAMERA_RIGHT_UP_TOP, "20260801_121000")]
     got2 = HR.cluster_into_batches(split, tolerance_sec=120)
     assert len(got2) == 2
+
+
+def test_historical_does_not_require_the_extraction_models():
+    """PIPELINE_SOURCE=raw is about the LIVE service.  Historical never builds an
+    ExtractionManager, so it must not demand the raw->trimmed classifiers --
+    which cannot be auto-synced from the flat S3 layout anyway."""
+    from core import config as CFG
+
+    # validate_config: the raw-extraction block is skipped for historical...
+    hist = CFG.validate_config(mode="historical", skip_upload=True, skip_email=True)
+    assert not any("extraction classify model" in e for e in hist), hist
+
+    # ...and still enforced for the live one-shot path, unchanged.
+    if CFG.PIPELINE_SOURCE.requires_extraction:
+        once = CFG.validate_config(mode="once", skip_upload=True, skip_email=True)
+        assert any("extraction" in e for e in once), once
+
+    # model_sync: main() must pass include_extraction=False for historical
+    import inspect
+    import orchestrator.master_runner as MR
+    src = inspect.getsource(MR.main)
+    assert "include_extraction=(False if args.historical else None)" in src

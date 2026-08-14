@@ -66,7 +66,7 @@ import os
 import sys
 import time
 import traceback
-from typing import List, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from global_train_state import (
     GlobalTrainState,
@@ -381,6 +381,29 @@ def _extract_one_camera(
     return tracks, master_cls, top_local
 
 
+def _derive_wagon_window(master: LocalCameraTracks, classifications, verbose=False):
+    """Derive the wagon window from the CURRENT master gaps + classifications.
+
+    Runtime-derived only: the window comes from the classified segments that the
+    master's own validated gaps define.  No frame numbers or timestamps are
+    assumed, so it holds for any train.
+
+    `build_global_wagons` is called here as the shared segment primitive -- the
+    same one `train_structure` uses -- not as a fusion algorithm.
+    """
+    if not classifications:
+        return None
+    try:
+        segments = ga.build_global_wagons(
+            list(master.gaps),
+            master_total_frames=master.total_frames, master_fps=master.fps,
+            initial_classifications=list(classifications),
+            support_camera_ids=[])
+        return ts.get_master_wagon_window(segments, verbose=verbose)
+    except Exception:
+        return None
+
+
 def _run_camera_only(args, verbose: bool) -> int:
     """`--camera-only CAM`: extract + persist one camera's gaps, then exit.
 
@@ -560,6 +583,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    default=_gv.min_mean_confidence)
     p.add_argument("--gap-min-monotonic", type=float,
                    default=_gv.min_monotonic_fraction)
+
+    # ---- DEPRECATED absolute-unit gap thresholds ----------------------------
+    # Superseded by the seconds / frame-width-fraction flags above, which
+    # generalize across trains and camera geometry.  Kept so an existing caller
+    # does not crash: a value given here is applied verbatim as a PER-CAMERA
+    # override at resolve() time and is never stored on the shared config, so it
+    # cannot leak from one camera's geometry into another's.
+    p.add_argument("--gap-min-track-frames", type=int, default=None)
+    p.add_argument("--gap-max-track-gap", type=int, default=None)
+    p.add_argument("--gap-min-motion-px", type=float, default=None)
+    p.add_argument("--gap-static-max-px", type=float, default=None)
+    p.add_argument("--gap-min-motion-px-sec", type=float, default=None)
+    p.add_argument("--gap-max-motion-px-sec", type=float, default=None)
+
+    p.add_argument("--no-wagon-recovery", action="store_true",
+                   help="Disable the WAGON_ACTIVE second validation pass.  By "
+                        "default a master candidate inside the confirmed wagon "
+                        "region that failed only a SOFT gate (speed, trajectory "
+                        "noise, weaker confidence) is re-examined and accepted "
+                        "if it still clears every HARD gate.")
 
     # ---- master-fixed cross-camera fusion -----------------------------------
     p.add_argument("--no-wagon-only", action="store_true",
@@ -843,6 +886,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         min_mean_confidence=float(args.gap_min_confidence),
         train_motion_tolerance=float(args.gap_motion_tolerance),
     )
+    # Deprecated absolute-unit flags -> per-camera overrides, converted with each
+    # camera's own width/fps at resolve() time.  Nothing absolute is stored on
+    # the config, so a value given for one geometry cannot leak into another.
+    gv_overrides: Dict[str, float] = {}
+    for flag, attr, target in (
+        ("--gap-min-track-frames", "gap_min_track_frames", "min_track_frames"),
+        ("--gap-max-track-gap", "gap_max_track_gap", "max_detection_gap_frames"),
+        ("--gap-min-motion-px", "gap_min_motion_px", "min_motion_px"),
+        ("--gap-static-max-px", "gap_static_max_px", "static_max_motion_px"),
+        ("--gap-min-motion-px-sec", "gap_min_motion_px_sec", "min_motion_px_per_sec"),
+        ("--gap-max-motion-px-sec", "gap_max_motion_px_sec", "max_motion_px_per_sec"),
+    ):
+        value = getattr(args, attr, None)
+        if value is not None:
+            gv_overrides[target] = float(value)
+            print(f"NOTE: {flag} is deprecated -- thresholds are now expressed "
+                  f"in seconds and frame-width fractions so they generalize "
+                  f"across trains and camera geometry.  Your value is applied "
+                  f"verbatim as a per-camera override for this run.",
+                  file=sys.stderr)
+
     gap_validation: Dict[str, gval.GapValidationResult] = {}
     for cam in ALL_CAMERAS:
         if cam not in tracks:
@@ -851,7 +915,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         raw_n = sum(len(v) for v in (t.raw_frame_detections or {}).values())
         res = gval.validate_gap_events(t.gaps, cam, gv_cfg,
                                        raw_detection_count=raw_n, verbose=verbose,
-                                       frame_width=t.width, fps=t.fps)
+                                       frame_width=t.width, fps=t.fps,
+                                       absolute_overrides=gv_overrides or None)
         gap_validation[cam] = res
         # Replace the camera's gap list with the validated subset and restore
         # track_id as a contiguous temporal rank, as the tracker produces.
@@ -933,6 +998,142 @@ def main(argv: Optional[List[str]] = None) -> int:
               "top semantic evidence disabled (gap-only classification).")
 
     # ------------------------------------------------------------------
+    # STEP 2b(ii) -- SUPPORT WAGON REGIONS
+    #
+    #   LEFT_UP       -> side_classification.pt   (a side view, same geometry)
+    #   RIGHT_UP_TOP  -> top_classification.pt
+    #   LEFT_UP_TOP   -> top_classification.pt
+    #
+    # Identifies each support camera's OWN engine / wagon / brake-van span, so
+    # engine and brake-van observations are kept OUT of wagon synchronization.
+    # Support cameras are never counting authorities: under master-fixed fusion
+    # this changes which support gap matches which master gap (evidence
+    # association), never how many global gaps exist.
+    #
+    # Present cameras only.  A camera whose model is missing, or whose
+    # classification raises, gets an explanatory LocalWagonRegion rather than
+    # silently aligning over its whole footage.
+    # ------------------------------------------------------------------
+    support_regions: Dict[str, ts.LocalWagonRegion] = {}
+    classification_models: Dict[str, str] = {
+        master_cam: os.path.basename(side_cls_path) if side_cls_path else "",
+    }
+    temporal_results: Dict[str, Any] = {}
+    tc_cfg = tcls.DEFAULT_TEMPORAL_CLASSIFICATION
+
+    print()
+    print("-" * 70)
+    print("  STEP 2b(ii)  Support wagon regions (per-camera engine/wagon span)")
+    print("-" * 70)
+    _clf_cache: Dict[str, Any] = {}
+    for cam in ALL_CAMERAS:
+        if cam not in tracks or cam == master_cam:
+            continue
+        want = ts.CAMERA_CLASSIFICATION_MODEL.get(cam)
+        path = top_cls_path if want == ts.TOP_CLASSIFICATION_MODEL else side_cls_path
+        if not path:
+            classification_models[cam] = f"{want} (MISSING)"
+            support_regions[cam] = ts.LocalWagonRegion(
+                camera_id=cam, classifier_model=f"{want} (missing)",
+                reason=f"{want} not available; camera not classified")
+            print(f"  [CLASSIFY/{cam}] SKIPPED -- {want} is not available")
+            continue
+        try:
+            if path not in _clf_cache:
+                # Load each model ONCE and reuse it across cameras.
+                _clf_cache[path] = ts.load_segment_classifier(
+                    path, num_samples=args.classification_samples, verbose=verbose)
+            clf, mapping = _clf_cache[path]
+            classification_models[cam] = os.path.basename(path)
+
+            t = tracks[cam]
+            segs = segments_from_gaps(t.gaps, t.total_frames)
+            labels: List[str] = []
+            if segs:
+                cls = clf.classify_segments(t.video_path, segs)
+                # Same temporal smoothing the master gets, so a support camera's
+                # region is not moved by a single bad observation.
+                cls, tres = tcls.apply_temporal_classification(
+                    cls, t.fps, camera_id=cam, cfg=tc_cfg,
+                    sample_history=getattr(clf, "sample_history", None),
+                    verbose=verbose)
+                temporal_results[cam] = tres
+                labels = [c.label for c in cls]
+            support_regions[cam] = ts.build_local_wagon_region(
+                cam, segs, labels, t.fps,
+                classifier_model=os.path.basename(path),
+                unmapped_classes=mapping.unmapped, verbose=verbose)
+        except Exception as e:
+            print(f"WARNING: support classification failed for {cam}: {e}",
+                  file=sys.stderr)
+            support_regions[cam] = ts.LocalWagonRegion(
+                camera_id=cam, classifier_model=os.path.basename(str(path)),
+                reason=f"classification error: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    # STEP 2c -- WAGON_ACTIVE RECOVERY  (second validation pass)
+    #
+    # Validation had to run in STEP 1b, before classification, because
+    # classification needs the segments that validated gaps define.  So the
+    # first pass could not know the train state.  Now that the wagon window
+    # exists, re-examine the master candidates that fell INSIDE it and failed
+    # only a SOFT gate (speed vs the local reference, absolute speed band,
+    # sub-floor displacement, weaker confidence, noisier trajectory).
+    #
+    # Every HARD gate still rejects: untracked, insufficient confirmation,
+    # mostly-blind track, isolated static artefact, wrong direction, duplicate,
+    # minimum-separation duplicate.  Recovery also re-checks duplicate and
+    # separation against the accepted set, so it cannot crowd an existing gap.
+    #
+    # This is what makes a genuine wagon gap inside the wagon run count
+    # immediately, instead of waiting for a further classification event.
+    # ------------------------------------------------------------------
+    recovery = None
+    if (not args.no_gap_validation and not args.no_wagon_recovery
+            and gap_validation.get(master_cam)):
+        print()
+        print("-" * 70)
+        print("  STEP 2c  WAGON_ACTIVE recovery (soft-failed gaps inside the "
+              "wagon region)")
+        print("-" * 70)
+        _win = _derive_wagon_window(master, initial_classifications, verbose=False)
+        if _win is not None and _win.wagon_start_frame is not None:
+            print(f"  wagon window (runtime-derived): frames "
+                  f"{_win.wagon_start_frame}-{_win.wagon_end_frame}")
+            recovery = gval.recover_wagon_active_candidates(
+                gap_validation[master_cam].rejected,
+                master.gaps,
+                _win.wagon_start_frame, _win.wagon_end_frame,
+                master_cam, gv_cfg,
+                frame_width=master.width, fps=master.fps,
+                absolute_overrides=gv_overrides or None, verbose=verbose)
+            if recovery.recovered:
+                master.gaps = gval.renumber_gap_events(
+                    list(master.gaps) + list(recovery.recovered))
+                # The master gap sequence changed, so the segments and therefore
+                # the classification must be rebuilt from it.
+                print(f"  recovered {len(recovery.recovered)} gap(s) -> "
+                      f"re-deriving master segments and classification")
+                try:
+                    initial_classifications = _classify_master_pre_fusion(
+                        master, side_cls_path,
+                        num_samples=args.classification_samples, verbose=False)
+                    if initial_classifications:
+                        initial_classifications, tres2 = \
+                            tcls.apply_temporal_classification(
+                                initial_classifications, master.fps,
+                                camera_id=master_cam, cfg=tc_cfg, verbose=False)
+                        temporal_results[master_cam] = tres2
+                except Exception as e:
+                    print(f"WARNING: re-classification after recovery failed: "
+                          f"{e}", file=sys.stderr)
+            else:
+                print("  no gap recovered -- every wagon-window candidate either "
+                      "passed already or failed a hard gate")
+        else:
+            print("  no wagon window derived -- recovery skipped")
+
+    # ------------------------------------------------------------------
     # STEP 3 -- cross-camera fusion (support = present non-master cameras)
     # ------------------------------------------------------------------
     print()
@@ -941,15 +1142,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("-" * 70)
     support = [tracks[c] for c in ALL_CAMERAS if c in tracks and c != master_cam]
     support_present = [c for c in ALL_CAMERAS if c in tracks and c != master_cam]
-
-    # Per-support-camera wagon regions (reference STEP 2b).  NOT YET WIRED:
-    # `train_structure.build_local_wagon_region` needs the support cameras' own
-    # semantic labels, which our STEP 2b produces in a different shape than the
-    # reference's `temporal_classification`.  Empty means each support camera is
-    # aligned over its whole footage -- the same as passing --no-wagon-only.
-    # This affects EVIDENCE ASSOCIATION only: under master-fixed fusion the
-    # wagon COUNT is the master's validated gap count either way.
-    support_regions: Dict[str, ts.LocalWagonRegion] = {}
 
     # MASTER-FIXED FUSION -- the single authoritative construction path.
     #

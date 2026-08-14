@@ -561,8 +561,10 @@ def test_historical_dispatch_never_enters_run_auto():
         os.environ.pop("WAGONEYE_LOG_DIR", None)
 
     assert rc == 0
-    # validated with the one-shot ruleset, delivery off -> email not required
-    assert seen["validate"]["mode"] == "once"
+    # validated with the historical ruleset: same S3 requirements as a
+    # one-shot run, but exempt from the raw-extraction models (historical
+    # never builds an ExtractionManager).  Delivery off -> email not required.
+    assert seen["validate"]["mode"] == "historical"
     assert seen["validate"]["skip_upload"] is True
     assert seen["validate"]["skip_email"] is True
     assert seen["hist"].date == "2026-08-08"

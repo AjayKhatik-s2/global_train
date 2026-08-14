@@ -1037,18 +1037,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         mode = "auto"
 
-    # Historical mode needs exactly the same configuration a one-shot S3 run
-    # needs (input bucket/prefixes, output bucket), so it is validated as
-    # `once` rather than teaching validate_config a new mode -- no change to
-    # the existing validation rules.  Delivery is off unless opted into, which
-    # is what lets a historical run skip the email-endpoint requirement.
+    # Historical mode needs the same S3 configuration a one-shot run needs
+    # (input bucket/prefixes, output bucket), so it reuses the `once` ruleset --
+    # EXCEPT that it is always a pure consumer of already-trimmed clips and
+    # never builds an ExtractionManager, so it must not inherit `once`'s
+    # raw-extraction model requirement.  `validate_config` keys that exemption
+    # off mode == "historical".  Delivery is off unless opted into, which is
+    # what lets a historical run skip the email-endpoint requirement.
     _hist_no_deliver = args.historical and not args.historical_deliver
     skip_upload_eff = args.skip_upload or args.local_only or _hist_no_deliver
     skip_email_eff = args.skip_email or args.local_only or _hist_no_deliver
 
     log.info("%s", CFG.startup_summary(mode=mode))
     cfg_errors = CFG.validate_config(
-        mode=("once" if args.historical else mode),
+        mode=("historical" if args.historical else mode),
         skip_upload=skip_upload_eff,
         skip_email=skip_email_eff,
     )

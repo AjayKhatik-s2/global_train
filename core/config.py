@@ -324,8 +324,8 @@ def validate_config(*, mode: str, skip_upload: bool = False,
                     skip_email: bool = False) -> list:
     """Return a list of human-readable configuration errors (empty = OK).
 
-    `mode` is 'auto' | 'local' | 'once' | 'batch'.  The caller fails fast and
-    refuses to poll when this is non-empty.
+    `mode` is 'auto' | 'local' | 'once' | 'batch' | 'historical'.  The caller
+    fails fast and refuses to poll when this is non-empty.
     """
     from core import constants as C
     errors: list = []
@@ -353,14 +353,14 @@ def validate_config(*, mode: str, skip_upload: bool = False,
         errors.append("EMAIL_INTERIM_REPORTS=true requires GENERATE_INTERIM_REPORTS=true")
 
     # S3 discovery for continuous polling
-    if mode in ("auto", "once", "batch"):
+    if mode in ("auto", "once", "batch", "historical"):
         if not C.S3_OUTPUT_BUCKET:
             errors.append("WAGONEYE_S3_OUTPUT_BUCKET is required for --auto/--once/--batch")
         if not C.S3_INPUT_PREFIXES:
             errors.append("WAGONEYE_S3_INPUT_PREFIXES is empty -- --auto would discover "
                           "nothing.  Set it to the camera-video prefix(es).")
     # delivery endpoints required unless explicitly skipped
-    if mode in ("auto", "once", "batch"):
+    if mode in ("auto", "once", "batch", "historical"):
         if not skip_email and (not C.EMAIL_API_URL or not C.EMAIL_RECEIVER):
             errors.append("email enabled but EMAIL_API_URL / EMAIL_RECEIVER missing "
                           "(or pass --skip-email)")
@@ -368,7 +368,13 @@ def validate_config(*, mode: str, skip_upload: bool = False,
     # ---- pipeline source = raw: this process produces its own trimmed clips ----
     # Fail fast here instead of letting every per-camera sweep raise
     # FileNotFoundError once a minute for the life of the service.
-    if PIPELINE_SOURCE.requires_extraction:
+    #
+    # `historical` is exempt: it is ALWAYS a pure consumer of already-trimmed
+    # clips (it never constructs an ExtractionManager), so the extraction
+    # classifiers are irrelevant to it even when the deployment's env says
+    # PIPELINE_SOURCE=raw for the live service.  Demanding them there blocked a
+    # historical re-run on a box that consumes trimmed clips perfectly well.
+    if PIPELINE_SOURCE.requires_extraction and mode != "historical":
         if not os.path.isdir(EXTRACTION_MODELS_DIR):
             errors.append(
                 f"PIPELINE_SOURCE=raw but the extraction models dir does not "
@@ -389,7 +395,7 @@ def validate_config(*, mode: str, skip_upload: bool = False,
     # ---- OCR engine ----
     # Rekognition is the default engine; it needs boto3 + a region.  A missing
     # dependency is reported at startup rather than degrading silently per wagon.
-    if mode in ("auto", "once", "batch") and OCR_ENGINE == "rekognition":
+    if mode in ("auto", "once", "batch", "historical") and OCR_ENGINE == "rekognition":
         try:
             import boto3  # noqa: F401
         except ImportError:
